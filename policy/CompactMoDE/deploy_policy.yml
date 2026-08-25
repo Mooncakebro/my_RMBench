@@ -1,0 +1,17 @@
+# CompactMoDE eval configuration (consumed by script/eval_policy.py).
+# Standard RMBench keys first, CompactMoDE-specific keys at the bottom.
+policy_name: CompactMoDE
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+expert_data_num: null
+checkpoint_num: 0
+head_camera_type: D435
+
+# ── CompactMoDE-specific ──
+variant: compact            # "compact" (with side memory) | "baseline" (plain Qwen3-VL-2B + DiT)
+checkpoint_path: null       # dir written by save_pretrained(), e.g. policy/CompactMoDE/runs/compact/final
+num_sampling_steps: 10      # EDM DDIM denoising steps at inference

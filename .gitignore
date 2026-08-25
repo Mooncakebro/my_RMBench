@@ -29,3 +29,6 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+
+data_lerobot/
+policy/CompactMoDE/runs/
