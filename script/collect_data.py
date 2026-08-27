@@ -5,7 +5,6 @@ sys.path.append("./")
 import sapien.core as sapien
 from sapien.render import clear_cache
 from collections import OrderedDict
-import pdb
 from envs import *
 import yaml
 import importlib
@@ -24,8 +23,8 @@ def class_decorator(task_name):
     try:
         env_class = getattr(envs_module, task_name)
         env_instance = env_class()
-    except:
-        raise SystemExit("No such task")
+    except Exception as e:
+        raise SystemExit(f"No such task: {e}")
     return env_instance
 
 
@@ -55,7 +54,7 @@ def main(task_name=None, task_config=None):
     def get_embodiment_file(embodiment_type):
         robot_file = _embodiment_types[embodiment_type]["file_path"]
         if robot_file is None:
-            raise "missing embodiment files"
+            raise ValueError("missing embodiment files")
         return robot_file
 
     if len(embodiment_type) == 1:
@@ -68,7 +67,7 @@ def main(task_name=None, task_config=None):
         args["embodiment_dis"] = embodiment_type[2]
         args["dual_arm_embodied"] = False
     else:
-        raise "number of embodiment config parameters should be 1 or 3"
+        raise ValueError("number of embodiment config parameters should be 1 or 3")
 
     args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
     args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])

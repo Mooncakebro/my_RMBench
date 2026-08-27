@@ -304,3 +304,142 @@ class MemoryMattersAgent:
         return {
             "normalized_actions": pred_actions.detach().cpu().numpy(),
         }
+
+    def eval_init(self, image_np: np.ndarray) -> str:
+        """
+        Initialize for a new episode.  Called once when is_init == 0.
+        Saves the initial image, runs the planner (Mn) or sets instruction (M1),
+        and starts video ffmpeg.
+
+        Args:
+            image_np: (H, W, 3) uint8 head-camera RGB from TASK_ENV.
+
+        Returns:
+            instruction string.
+        """
+        from PIL import Image
+        self.is_init = 1
+        Image.fromarray(image_np).save("./_tmp_visual/init.png")
+
+        if self.task_type == "Mn":
+            self.init_high_with_image()
+        elif self.task_type == "M1":
+            self.instruction = self.config.get("global_task", "")
+            self._set_video_ffmpeg()
+
+        return self.instruction
+
+    def eval_step(self, obs_payload: dict) -> dict:
+        """
+        Server-side eval step: process one observation through the model.
+
+        Args:
+            obs_payload: dict with keys 'image' (PIL), 'state' (np.ndarray), 'instruction' (str).
+
+        Returns:
+            dict with:
+              'actions': (T, D) np.ndarray of env-ready actions
+              'instruction': current instruction string
+              'sub_end_flag': subtask end flag (for Mn tasks)
+              'episode_done': True if Mn subtask sequence is complete
+        """
+        instruction = self.instruction
+        obs_payload["instruction"] = instruction
+
+        if self.action_count == 0:
+            self.update_obs(obs_payload)
+
+        result = self.get_action()
+        if result is None or len(result) == 0:
+            cprint("[deploy] no actions produced", "red")
+            return {"actions": None, "instruction": instruction,
+                    "sub_end_flag": 0, "episode_done": False}
+
+        self.accumulate_actions_chunk(result["normalized_actions"])
+        smoothed = self.get_smoothed_actions(self.iter, self.action_strip)
+
+        # Postprocess: denormalize, reorder layout, clip grippers
+        import importlib
+        deploy_mod = importlib.import_module("Mem-0.deploy_policy")
+        actions = deploy_mod._postprocess_action_chunk(smoothed)
+
+        steps_to_run = min(self.action_strip, actions.shape[0])
+        sub_end_flag = 0
+        episode_done = False
+
+        # Write current frame to video
+        if hasattr(self, "ffmpeg") and self.ffmpeg is not None:
+            # image is in obs_payload as PIL; convert to raw bytes
+            pil_img = obs_payload.get("image")
+            if pil_img is not None:
+                import numpy as np
+                img_np = np.array(pil_img)
+                self.ffmpeg.stdin.write(img_np.tobytes())
+
+        return {
+            "actions": actions[:steps_to_run],
+            "instruction": instruction,
+            "sub_end_flag": sub_end_flag,
+            "episode_done": episode_done,
+            "steps_to_run": steps_to_run,
+        }
+
+    def eval_update(self, obs_payload: dict) -> dict:
+        """
+        Server-side: update memory after executing one step.
+
+        Args:
+            obs_payload: dict with 'image' (PIL), 'state', 'instruction'.
+
+        Returns:
+            dict with 'sub_end_flag' and 'episode_done' (Mn tasks).
+        """
+        sub_end_flag = self.update_obs(obs_payload)
+
+        if self.task_type == "Mn":
+            if sub_end_flag == 1:
+                cprint(f"[deploy] subtask end signal += 1 on [{self.iter}]", "yellow")
+            if self.end_signal_count >= self.threshold:
+                episode_done = True
+                # Save stage image for planner
+                import numpy as np
+                from PIL import Image
+                pil_img = obs_payload.get("image")
+                if pil_img is not None:
+                    Image.fromarray(np.array(pil_img)).save(
+                        f"./_tmp_visual/image_{self.stage}.png")
+
+                if hasattr(self, "ffmpeg") and self.ffmpeg is not None:
+                    img_np = np.array(pil_img) if pil_img is not None else None
+                    if img_np is not None:
+                        self.ffmpeg.stdin.write(img_np.tobytes())
+                self._del_video_ffmpeg()
+
+                cprint(f"[deploy] subtask end detected; moving to stage {self.stage + 1}, "
+                       f"action_count {self.action_count}", "green")
+                self.update_high_observation()
+                self.end_signal_count = 0
+                self.action_count = 0
+                self.executor.memory_bank.reset()
+
+                if hasattr(self, "ffmpeg") and self.ffmpeg is not None:
+                    if pil_img is not None:
+                        self.ffmpeg.stdin.write(np.array(pil_img).tobytes())
+
+                return {
+                    "sub_end_flag": sub_end_flag,
+                    "episode_done": True,
+                    "instruction": self.instruction,
+                }
+            else:
+                return {
+                    "sub_end_flag": sub_end_flag,
+                    "episode_done": False,
+                    "instruction": self.instruction,
+                }
+        else:
+            return {
+                "sub_end_flag": sub_end_flag,
+                "episode_done": False,
+                "instruction": self.instruction,
+            }

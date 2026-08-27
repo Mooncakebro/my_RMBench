@@ -157,7 +157,11 @@ class ModelServer:
                     # Find corresponding model method
                     method = getattr(self.model, cmd, None)
                     if not callable(method):
-                        raise AttributeError(f"No model method named '{cmd}'")
+                        # Try common aliases
+                        if cmd == "reset_model":
+                            method = getattr(self.model, "reset", None)
+                        if not callable(method):
+                            raise AttributeError(f"No model method named '{cmd}'")
 
                     # Call method with or without obs
                     result = method(obs) if obs is not None else method()

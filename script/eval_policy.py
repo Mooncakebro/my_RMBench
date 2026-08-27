@@ -17,7 +17,7 @@ import yaml
 from datetime import datetime
 import importlib
 import argparse
-import pdb
+import ast
 
 from generate_episode_instructions import *
 
@@ -30,8 +30,8 @@ def class_decorator(task_name):
     try:
         env_class = getattr(envs_module, task_name)
         env_instance = env_class()
-    except:
-        raise SystemExit("No Task")
+    except Exception as e:
+        raise SystemExit(f"No Task: {e}")
     return env_instance
 
 
@@ -91,7 +91,7 @@ def main(usr_args):
     def get_embodiment_file(embodiment_type):
         robot_file = _embodiment_types[embodiment_type]["file_path"]
         if robot_file is None:
-            raise "No embodiment files"
+            raise ValueError("No embodiment files")
         return robot_file
 
     with open(CONFIGS_PATH + "_camera_config.yml", "r", encoding="utf-8") as f:
@@ -111,7 +111,7 @@ def main(usr_args):
         args["embodiment_dis"] = embodiment_type[2]
         args["dual_arm_embodied"] = False
     else:
-        raise "embodiment items should be 1 or 3"
+        raise ValueError("embodiment items should be 1 or 3")
 
     args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
     args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
@@ -189,8 +189,7 @@ def main(usr_args):
         # Success Rate
         success_rates = (np.asarray(suc_nums, dtype=float) / float(test_num)).reshape(-1)
         for sr in success_rates:
-            file.write(f"Success Rate: {sr}\n")
-
+            file.write(f"Success Rate: {sr}\n")        file.write(f"Top-{topk} Success Rate: {topk_success_rate}\n")
         file.write("\n")  # 分隔一下
 
         # Reward
@@ -354,6 +353,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
+    print(f"\033[90mSuccessful test seeds: {suc_test_seed_list}\033[0m")
     return now_seed, TASK_ENV.suc, task_total_reward
 
 
@@ -373,8 +373,8 @@ def parse_args_and_config():
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
             try:
-                value = eval(value)
-            except:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             override_dict[key] = value
         return override_dict

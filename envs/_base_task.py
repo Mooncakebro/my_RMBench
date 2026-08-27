@@ -43,7 +43,7 @@ class Base_Task(gym.Env):
         """
         Initialization TODO
         - `self.FRAME_IDX`: The index of the file saved for the current scene.
-        - `self.fcitx5-configtool`: Left gripper pose (close <=0, open >=0.4).
+        - `self.left_gripper_pose`: Left gripper pose (close <=0, open >=0.4).
         - `self.ep_num`: Episode ID.
         - `self.task_name`: Task name.
         - `self.save_dir`: Save path.`
@@ -98,6 +98,7 @@ class Base_Task(gym.Env):
         self.now_obs = {}
         self.take_action_cnt = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
+        self.eval_video_ffmpeg = None
 
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
@@ -1527,9 +1528,12 @@ class Base_Task(gym.Env):
             return
 
         eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            # self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
+        if (self.eval_video_path is not None and self.eval_video_ffmpeg is not None
+                and self.take_action_cnt % eval_video_freq == 0):
+            frame = self.now_obs.get("third_view_rgb")
+            if frame is None:
+                frame = self.now_obs["observation"]["head_camera"]["rgb"]
+            self.eval_video_ffmpeg.stdin.write(frame.tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1715,8 +1719,11 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
+if (self.eval_video_path is not None and self.eval_video_ffmpeg is not None):
+                frame = self.now_obs.get("third_view_rgb")
+                if frame is None:
+                    frame = self.now_obs["observation"]["head_camera"]["rgb"]
+                self.eval_video_ffmpeg.stdin.write(frame.tobytes())
                 return
 
         self._update_render()

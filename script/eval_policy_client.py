@@ -1,6 +1,12 @@
 import sys
 import os
 import subprocess
+import socket
+import json
+import threading
+import time
+import random
+import base64
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -17,38 +23,15 @@ import yaml
 from datetime import datetime
 import importlib
 import argparse
-import pdb
+import ast
+
+from typing import Any
 
 from generate_episode_instructions import *
-
-
-import sys
-import os
-import subprocess
-import socket
-import json
-import threading
-import time
-import random
-import traceback
-import yaml
-from datetime import datetime
-import importlib
-import argparse
-from pathlib import Path
-from collections import deque
-
-import numpy as np
-import json
-from typing import Any
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
-import numpy as np
-import json
-from typing import Any
-import base64
 
 class NumpyEncoder(json.JSONEncoder):
     """Enhanced json encoder for numpy types with array reconstruction info"""
@@ -98,8 +81,8 @@ def class_decorator(task_name):
     try:
         env_class = getattr(envs_module, task_name)
         env_instance = env_class()
-    except:
-        raise SystemExit("No Task")
+    except Exception as e:
+        raise SystemExit(f"No Task: {e}")
     return env_instance
 
 
@@ -258,7 +241,7 @@ def main(usr_args):
     def get_embodiment_file(embodiment_type):
         robot_file = _embodiment_types[embodiment_type]["file_path"]
         if robot_file is None:
-            raise "No embodiment files"
+            raise ValueError("No embodiment files")
         return robot_file
 
     with open(CONFIGS_PATH + "_camera_config.yml", "r", encoding="utf-8") as f:
@@ -278,7 +261,7 @@ def main(usr_args):
         args["embodiment_dis"] = embodiment_type[2]
         args["dual_arm_embodied"] = False
     else:
-        raise "embodiment items should be 1 or 3"
+        raise ValueError("embodiment items should be 1 or 3")
 
     args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
     args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
@@ -331,7 +314,7 @@ def main(usr_args):
 
     # model = get_model(usr_args)
     model = ModelClient(port=port)
-    st_seed, suc_num = eval_policy(task_name,
+    st_seed, suc_num, task_total_reward = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
                                    model,
@@ -348,7 +331,8 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
-        # file.write(str(task_reward) + '\n')
+        file.write(f"Total reward: {task_total_reward}\n")
+        file.write(f"Top-{topk} Success Rate: {topk_success_rate}\n")
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
     print(f"Data has been saved to {file_path}")
@@ -465,7 +449,7 @@ def eval_policy(task_name,
             if TASK_ENV.eval_success:
                 succ = True
                 break
-        # task_total_reward += TASK_ENV.episode_score
+        task_total_reward += TASK_ENV.max_reward
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
@@ -490,7 +474,8 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    print(f"\033[90mSuccessful test seeds: {suc_test_seed_list}\033[0m")
+    return now_seed, TASK_ENV.suc, task_total_reward
 
 
 def parse_args_and_config():
@@ -512,8 +497,8 @@ def parse_args_and_config():
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
             try:
-                value = eval(value)
-            except:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             override_dict[key] = value
         return override_dict

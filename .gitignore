@@ -32,3 +32,6 @@ envs/curobo/*
 
 data_lerobot/
 policy/CompactMoDE/runs/
+POTENTIAL_BUGS.md
+data/
+assets/

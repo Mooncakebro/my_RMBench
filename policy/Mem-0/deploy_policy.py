@@ -252,10 +252,25 @@ def get_model(usr_args: dict) -> MemoryMattersAgent:
     return agent
 
 
-def eval(TASK_ENV, model: MemoryMattersAgent, observation: dict):
+def eval(TASK_ENV, model, observation: dict):
     """
     Execute one chunk of actions in the environment.
+
+    Works with both local model (MemoryMattersAgent) and remote ModelClient.
+    When model is a MemoryMattersAgent (local eval), calls model methods directly.
+    When model is a ModelClient (client-server eval), calls through socket.
     """
+    # Check if model is a remote client (has 'call' method but not 'is_init')
+    is_remote = not hasattr(model, "is_init") and hasattr(model, "call")
+
+    if is_remote:
+        return _eval_remote(TASK_ENV, model, observation)
+    else:
+        return _eval_local(TASK_ENV, model, observation)
+
+
+def _eval_local(TASK_ENV, model: MemoryMattersAgent, observation: dict):
+    """Local eval — model is the real MemoryMattersAgent."""
     if model.is_init == 0:
         model.is_init = 1
         image = TASK_ENV.now_obs["observation"]["head_camera"]["rgb"]
@@ -288,7 +303,8 @@ def eval(TASK_ENV, model: MemoryMattersAgent, observation: dict):
         smoothed_model_actions = model.get_smoothed_actions(model.iter, model.action_strip)
         actions = _postprocess_action_chunk(smoothed_model_actions)
     
-    model.ffmpeg.stdin.write(TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+    if hasattr(model, 'ffmpeg') and model.ffmpeg is not None:
+        model.ffmpeg.stdin.write(TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes())
     
     # Execute only `action_strip` smoothed steps for current eval
     steps_to_run = min(model.action_strip, actions.shape[0])
@@ -318,8 +334,9 @@ def eval(TASK_ENV, model: MemoryMattersAgent, observation: dict):
     # --- For Mn Tasks
     if model.task_type == "Mn":
         if model.end_signal_count >= model.threshold:
-            model.ffmpeg.stdin.write (TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes ())
-            model._del_video_ffmpeg ()
+            if hasattr(model, 'ffmpeg') and model.ffmpeg is not None:
+                model.ffmpeg.stdin.write (TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes ())
+                model._del_video_ffmpeg ()
             cprint (f"[deploy] subtask end detected; moving to stage {model.stage + 1}, action_count {model.action_count}", "green")
             model.update_high_observation ()
             
@@ -327,11 +344,68 @@ def eval(TASK_ENV, model: MemoryMattersAgent, observation: dict):
             model.action_count = 0
             model.executor.memory_bank.reset ()
             
-            model.ffmpeg.stdin.write (TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes ())
+            if hasattr(model, 'ffmpeg') and model.ffmpeg is not None:
+                model.ffmpeg.stdin.write (TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes ())
             instruction = model.instruction
     # --- The End
 
-def reset_model(model: Optional[MemoryMattersAgent] = None):
+
+def _eval_remote(TASK_ENV, model, observation: dict):
+    """
+    Client-server eval — model is a ModelClient (socket wrapper).
+    Calls server-side model methods through the socket.
+    """
+    # Initialize on first call
+    if not hasattr(model, '_is_init') or not model._is_init:
+        model._is_init = True
+        image = TASK_ENV.now_obs["observation"]["head_camera"]["rgb"]
+        instruction = model.call("eval_init", image)
+        model._instruction = instruction
+
+    instruction = getattr(model, "_instruction", "")
+    observation["instruction"] = instruction
+    encoded_obs = encode_obs(observation)
+
+    # Get action chunk from server
+    result = model.call("eval_step", encoded_obs)
+    if result is None or result.get("actions") is None:
+        cprint("[deploy] no actions produced from server", "red")
+        raise SystemExit("Empty actions from model; aborting eval.")
+
+    actions = result["actions"]
+    instruction = result.get("instruction", instruction)
+    model._instruction = instruction
+    steps_to_run = result.get("steps_to_run", min(model.action_strip if hasattr(model, 'action_strip') else 1, actions.shape[0]))
+
+    # Execute actions locally in the environment
+    for idx in range(steps_to_run):
+        action = actions[idx]
+        TASK_ENV.take_action(action, action_type="qpos")
+
+        observation = TASK_ENV.get_obs()
+        observation["instruction"] = instruction
+        encoded_obs = encode_obs(observation)
+
+        # Update server-side memory after each step
+        update_result = model.call("eval_update", encoded_obs)
+        if update_result.get("episode_done", False):
+            break
+
+    # Sync instruction (may have changed due to Mn subtask transition)
+    model._instruction = update_result.get("instruction", instruction)
+
+def reset_model(model=None):
     """Clear memory at the beginning of every episode."""
-    if model is not None:
+    if model is None:
+        return
+    # Remote client: call reset through the socket
+    if hasattr(model, "call") and not hasattr(model, "reset"):
+        model.call(func_name="reset_model")
+        # Reset client-side state
+        if hasattr(model, "_is_init"):
+            model._is_init = False
+        if hasattr(model, "_instruction"):
+            model._instruction = ""
+    else:
+        # Local model: call reset directly
         model.reset()

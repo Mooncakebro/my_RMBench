@@ -32,12 +32,21 @@ URDF_LOADER=$SAPIEN_LOCATION/wrapper/urdf_loader.py
 # 674                 self.ignore_pairs = self.parse_srdf(f.read())
 sed -i -E 's/("r")(\))( as)/\1, encoding="utf-8") as/g' $URDF_LOADER
 
+# Verify the sapien patch was applied
+if ! grep -q 'encoding="utf-8"' "$URDF_LOADER" 2>/dev/null; then
+    echo "WARNING: sapien urdf_loader.py patch may not have been applied. Check sapien version."
+fi
+
 
 echo "Adjusting code in mplib/planner.py ..."
 # location of mplib, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/mplib"
 MPLIB_LOCATION=$(pip show mplib | grep 'Location' | awk '{print $2}')/mplib
 
 # Adjust some code in planner.py
+# Note: This removes the 'or collide' check from the screw plan condition.
+# This is intentional: mplib's collision check can be overly conservative
+# in cluttered table scenes, causing valid plans to fail. Removing it
+# allows the planner to find paths that would otherwise be rejected.
 # ----------- before -----------
 # 807             if np.linalg.norm(delta_twist) < 1e-4 or collide or not within_joint_limit:
 # 808                 return {"status": "screw plan failed"}
@@ -46,6 +55,11 @@ MPLIB_LOCATION=$(pip show mplib | grep 'Location' | awk '{print $2}')/mplib
 # 808                 return {"status": "screw plan failed"}
 PLANNER=$MPLIB_LOCATION/planner.py
 sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' $PLANNER
+
+# Verify the mplib patch was applied
+if grep -q 'or collide' "$PLANNER" 2>/dev/null; then
+    echo "WARNING: mplib planner.py patch may not have been applied. Check mplib version."
+fi
 
 echo "Installing Curobo ..."
 cd envs

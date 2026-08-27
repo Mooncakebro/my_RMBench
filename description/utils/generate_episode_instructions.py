@@ -61,8 +61,9 @@ def replace_placeholders(instruction: str, episode_params: Dict[str, str]) -> st
                 value + ".json",
             )
             if not os.path.exists(json_path):
-                print(f"\033[1mERROR: '{json_path}' looks like a description file, but does not exist.\033[0m")
-                exit()
+                print(f"\033[1mWARNING: '{json_path}' looks like a description file, but does not exist. Using raw value.\033[0m")
+                instruction = instruction.replace(placeholder, value)
+                continue
 
         # Check if the value is a path to an existing JSON file
         json_path = os.path.join(os.path.join(parent_directory, "../objects_description"), value + ".json")
@@ -101,8 +102,9 @@ def replace_placeholders_unseen(instruction: str, episode_params: Dict[str, str]
                 value + ".json",
             )
             if not os.path.exists(json_path):
-                print(f"\033[1mERROR: '{json_path}' looks like a description file, but does not exist.\033[0m")
-                exit()
+                print(f"\033[1mWARNING: '{json_path}' looks like a description file, but does not exist. Using raw value.\033[0m")
+                instruction = instruction.replace(placeholder, value)
+                continue
 
         # Check if the value is a path to an existing JSON file
         json_path = os.path.join(os.path.join(parent_directory, "../objects_description"), value + ".json")
