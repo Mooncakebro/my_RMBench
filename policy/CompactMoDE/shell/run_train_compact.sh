@@ -6,7 +6,9 @@ set -e
 cd "$(dirname "$0")/.."
 
 TASK=${TASK:-swap_blocks}
-DATA_ROOT=${DATA_ROOT:-/home/spc/memory_arena/RMBench/data_lerobot}
+# Auto-detect repo root (parent of policy/)
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
+DATA_ROOT=${DATA_ROOT:-$REPO_ROOT/data_lerobot}
 OUTPUT_DIR=${OUTPUT_DIR:-$(pwd)/runs/compact_${TASK}}
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-VL-2B-Instruct}
 FREEZE_BASE=${FREEZE_BASE:-0}
@@ -25,8 +27,12 @@ TOP_K=${TOP_K:-2}
 SAVE_STEPS=${SAVE_STEPS:-1000}
 MEM_OPT=${MEM_OPT:-adamw}
 
-source /home/spc/anaconda3/etc/profile.d/conda.sh
-conda activate lerobot
+# Auto-detect conda (works on server and dev machine)
+if [ -z "$CONDA_PREFIX" ]; then
+    CONDA_BASE=${CONDA_BASE:-$(conda info --base 2>/dev/null || echo /opt/conda)}
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate lerobot
+fi
 # conda's libstdc++ must shadow the system one (GLIBCXX_3.4.29)
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
