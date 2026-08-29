@@ -19,6 +19,7 @@ CHUNK_SIZE=${CHUNK_SIZE:-8}
 LR=${LR:-1e-4}
 BASE_LR=${BASE_LR:-1e-5}
 MEMORY_LR=${MEMORY_LR:-5e-6}
+MEM_DIM=${MEM_DIM:-512}
 EMBED_DIM=${EMBED_DIM:-1024}
 N_LAYERS=${N_LAYERS:-6}
 N_HEADS=${N_HEADS:-8}
@@ -43,6 +44,7 @@ python train_compact.py \
   --base-model "$BASE_MODEL" --freeze-base "$FREEZE_BASE" --grad-ckpt "$GRAD_CKPT" \
   --max-steps "$MAX_STEPS" --num-streams "$NUM_STREAMS" --chunk-size "$CHUNK_SIZE" \
   --lr "$LR" --base-lr "$BASE_LR" --memory-lr "$MEMORY_LR" \
+  --mem-dim "$MEM_DIM" \
   --embed-dim "$EMBED_DIM" --n-layers "$N_LAYERS" --n-heads "$N_HEADS" \
   --num-experts "$NUM_EXPERTS" --top-k "$TOP_K" \
   --save-steps "$SAVE_STEPS" --mem-opt "$MEM_OPT"

@@ -118,7 +118,8 @@ TASK=swap_blocks NUM_STREAMS=8 CHUNK_SIZE=8 MAX_STEPS=10000 \
 Useful env vars (both scripts): `FREEZE_BASE=1` (freeze Qwen), `GRAD_CKPT=1`,
 `LR` (bridge+DiT, default 1e-4), `BASE_LR` (Qwen, 1e-5), `MEMORY_LR` (compact
 only, 5e-6), `EMBED_DIM/N_LAYERS/N_HEADS/NUM_EXPERTS/TOP_K` (DiT size),
-`DATA_ROOT`, `OUTPUT_DIR`, `SAVE_STEPS`, `TASK`.
+`MEM_DIM` (COMPACT memory feature dimension, default 512), `DATA_ROOT`,
+`OUTPUT_DIR`, `SAVE_STEPS`, `TASK`.
 
 Notes:
 - One optimizer step of `train_compact.py` = one chunk = NUM_STREAMS × CHUNK_SIZE
@@ -141,9 +142,9 @@ python script/eval_policy.py --config policy/CompactMoDE/deploy_policy.yml \
 ```
 
 (`variant` ∈ {compact, baseline}; `checkpoint_path` = a `save_pretrained` dir.
-Eval executes each predicted 10-step chunk open-loop; compact memory updates
-once per chunk. `deploy_policy.py` is written but untested in the simulator —
-verify it on the eval machine first.)
+The policy predicts a 10-step chunk but executes only its first action, then
+re-observes and replans. Compact memory therefore updates once per executed
+environment step.)
 
 ## Known issues / gotchas
 

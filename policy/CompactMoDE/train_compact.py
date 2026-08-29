@@ -59,6 +59,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
     p.add_argument("--base-lr", type=float, default=float(os.environ.get("BASE_LR", "1e-5")))
     p.add_argument("--memory-lr", type=float, default=float(os.environ.get("MEMORY_LR", "5e-6")))
+    p.add_argument("--mem-dim", type=int, default=int(os.environ.get("MEM_DIM", "512")))
     p.add_argument("--weight-decay", type=float, default=float(os.environ.get("WD", "0.01")))
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine")
@@ -132,6 +133,7 @@ def main():
         lr=args.lr,
         base_lr=args.base_lr,
         memory_lr=args.memory_lr,
+        mem_dim=args.mem_dim,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         max_grad_norm=args.grad_clip,

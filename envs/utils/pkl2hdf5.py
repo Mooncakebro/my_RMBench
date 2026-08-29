@@ -12,7 +12,12 @@ def images_encoding(imgs):
     padded_data = []
     max_len = 0
     for i in range(len(imgs)):
-        success, encoded_image = cv2.imencode(".jpg", imgs[i])
+        # Camera.get_rgb() returns RGB. OpenCV's encoder interprets a
+        # three-channel array as BGR, so convert explicitly before encoding.
+        bgr = cv2.cvtColor(imgs[i], cv2.COLOR_RGB2BGR)
+        success, encoded_image = cv2.imencode(".jpg", bgr)
+        if not success:
+            raise ValueError(f"failed to JPEG-encode image {i}")
         jpeg_data = encoded_image.tobytes()
         encode_data.append(jpeg_data)
         max_len = max(max_len, len(jpeg_data))

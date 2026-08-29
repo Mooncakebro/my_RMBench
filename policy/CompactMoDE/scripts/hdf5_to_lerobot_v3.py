@@ -8,7 +8,6 @@ consumes:
     <dst>/<task>/
       data/chunk-000/file-000.parquet
       videos/observation.images.fixed/chunk-000/file-000.mp4
-      videos/observation.images.handeye/chunk-000/file-000.mp4   (hardlink of fixed)
       meta/info.json
       meta/stats.json
       meta/tasks.parquet
@@ -18,9 +17,7 @@ Conventions (per task spec):
   * action[t] = joint_action/vector[t+1]   -> the final frame of each episode
     is dropped, so each episode contributes T-1 rows and T-1 video frames.
   * vector layout: [left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]
-  * head camera only; the loader's default image keys are
-    "observation.images.fixed" / "observation.images.handeye", so the head
-    stream is published under both keys (handeye is a hardlink).
+  * head camera only, published as "observation.images.fixed".
   * language instruction = instructions/episode{i}.json -> "seen"[0].
 
 HDF5 quirks handled here:
@@ -28,6 +25,10 @@ HDF5 quirks handled here:
     API cannot map -> low-level read with mtype=NATIVE_DOUBLE.
   * rgb datasets are NULLPAD fixed-length strings -> low-level read with the
     file's own string type, then strip trailing NULs before cv2.imdecode.
+  * Existing RMBench HDF5 files were written from RGB arrays through OpenCV's
+    BGR encoder without an explicit conversion. The decoded array is therefore
+    treated as RGB here and encoded into the output MP4 as rgb24. New HDF5
+    files created by envs/utils/pkl2hdf5.py use the corrected convention.
 
 Extensibility: language_annotation.json (per-episode subtask segments) can be
 merged later via `load_subtask_annotations()` + extra parquet columns; the
@@ -55,7 +56,7 @@ from h5py import h5s, h5t
 FPS = 30
 ACTION_DIM = 14
 IMG_H, IMG_W = 240, 320
-VIDEO_KEYS = ("observation.images.fixed", "observation.images.handeye")
+VIDEO_KEY = "observation.images.fixed"
 
 STATE_NAMES = (
     [f"left_joint_{i}" for i in range(6)]
@@ -138,7 +139,7 @@ class Mp4Encoder:
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
+            "-pix_fmt", "rgb24",
             "-s", f"{IMG_W}x{IMG_H}",
             "-r", str(fps),
             "-i", "pipe:0",
@@ -156,9 +157,9 @@ class Mp4Encoder:
         )
         self.frames_written = 0
 
-    def write(self, frame_bgr: np.ndarray) -> None:
-        assert frame_bgr.shape == (IMG_H, IMG_W, 3), frame_bgr.shape
-        self.proc.stdin.write(frame_bgr.tobytes())
+    def write(self, frame_rgb: np.ndarray) -> None:
+        assert frame_rgb.shape == (IMG_H, IMG_W, 3), frame_rgb.shape
+        self.proc.stdin.write(frame_rgb.tobytes())
         self.frames_written += 1
 
     def close(self) -> None:
@@ -171,7 +172,14 @@ class Mp4Encoder:
 # --------------------------------------------------------------------------- #
 # conversion
 # --------------------------------------------------------------------------- #
-def convert_task(task: str, src_root: Path, dst_root: Path, num_episodes: int, crf: int) -> dict:
+def convert_task(
+    task: str,
+    src_root: Path,
+    dst_root: Path,
+    num_episodes: int,
+    crf: int,
+    hdf5_color_order: str = "legacy-rgb",
+) -> dict:
     task_dir = src_root / task / "demo_clean"
     dst = dst_root / task
     if dst.exists():
@@ -179,7 +187,7 @@ def convert_task(task: str, src_root: Path, dst_root: Path, num_episodes: int, c
     (dst / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
     (dst / "meta").mkdir(parents=True, exist_ok=True)
 
-    encoder = Mp4Encoder(dst / "videos" / VIDEO_KEYS[0] / "chunk-000" / "file-000.mp4", crf=crf)
+    encoder = Mp4Encoder(dst / "videos" / VIDEO_KEY / "chunk-000" / "file-000.mp4", crf=crf)
 
     rows_index, rows_ep, rows_frame, rows_ts, rows_task = [], [], [], [], []
     actions_all, states_all = [], []
@@ -214,9 +222,16 @@ def convert_task(task: str, src_root: Path, dst_root: Path, num_episodes: int, c
         actions = vector[1:]   # (T-1, 14)
 
         for t in range(T - 1):
-            frame = cv2.imdecode(np.frombuffer(jpeg_frames[t], np.uint8), cv2.IMREAD_COLOR)
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg_frames[t], np.uint8), cv2.IMREAD_COLOR
+            )
             if frame is None or frame.shape != (IMG_H, IMG_W, 3):
-                raise RuntimeError(f"{task}/episode{ep} frame {t}: bad decode {None if frame is None else frame.shape}")
+                raise RuntimeError(
+                    f"{task}/episode{ep} frame {t}: bad decode "
+                    f"{None if frame is None else frame.shape}"
+                )
+            if hdf5_color_order == "standard-bgr":
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             encoder.write(frame)
 
         n = T - 1
@@ -235,15 +250,6 @@ def convert_task(task: str, src_root: Path, dst_root: Path, num_episodes: int, c
 
     if episodes_done == 0:
         raise RuntimeError(f"{task}: no episodes converted")
-
-    # second video key = hardlink (fallback: copy) of the head-camera stream
-    src_mp4 = dst / "videos" / VIDEO_KEYS[0] / "chunk-000" / "file-000.mp4"
-    dst_mp4 = dst / "videos" / VIDEO_KEYS[1] / "chunk-000" / "file-000.mp4"
-    dst_mp4.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(src_mp4, dst_mp4)
-    except OSError:
-        shutil.copy(src_mp4, dst_mp4)
 
     states = np.concatenate(states_all, axis=0)
     actions = np.concatenate(actions_all, axis=0)
@@ -276,11 +282,6 @@ def convert_task(task: str, src_root: Path, dst_root: Path, num_episodes: int, c
             "action": {"dtype": "float32", "shape": [ACTION_DIM], "names": STATE_NAMES},
             "observation.state": {"dtype": "float32", "shape": [ACTION_DIM], "names": STATE_NAMES},
             "observation.images.fixed": {
-                "dtype": "video", "shape": [IMG_H, IMG_W, 3],
-                "names": ["height", "width", "channels"],
-                "info": {"video.fps": FPS, "video.codec": "h264"},
-            },
-            "observation.images.handeye": {
                 "dtype": "video", "shape": [IMG_H, IMG_W, 3],
                 "names": ["height", "width", "channels"],
                 "info": {"video.fps": FPS, "video.codec": "h264"},
@@ -333,13 +334,33 @@ def main() -> None:
     parser.add_argument("--dst-root", type=Path, default=Path("/home/spc/memory_arena/RMBench/data_lerobot"))
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--crf", type=int, default=20)
+    parser.add_argument(
+        "--hdf5-color-order",
+        choices=("legacy-rgb", "standard-bgr"),
+        default="legacy-rgb",
+        help=(
+            "Color convention of the source HDF5 JPEGs. Existing RMBench "
+            "files use legacy-rgb because the original writer passed RGB "
+            "arrays directly to cv2.imencode; use standard-bgr for files "
+            "created by the corrected writer."
+        ),
+    )
     args = parser.parse_args()
 
     results = []
     for task in args.tasks:
         print(f"\n=== {task} ===", flush=True)
         try:
-            results.append(convert_task(task, args.src_root, args.dst_root, args.episodes, args.crf))
+            results.append(
+                convert_task(
+                    task,
+                    args.src_root,
+                    args.dst_root,
+                    args.episodes,
+                    args.crf,
+                    args.hdf5_color_order,
+                )
+            )
         except Exception as exc:
             print(f"  [FAIL] {task}: {exc}", flush=True)
             results.append({"task": task, "error": str(exc)})

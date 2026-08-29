@@ -109,7 +109,9 @@ def run_compact(samples, device):
         check_cond(cond, 1)
         m0 = memory["m"]
         assert len(m0) == model.num_layers == 28, f"layers {len(m0)}"
-        assert m0[0].shape == (1, 16, 512), f"memory shape {tuple(m0[0].shape)}"
+        assert m0[0].shape == (
+            1, model.cfg.num_mem_tokens, model.cfg.mem_dim
+        ), f"memory shape {tuple(m0[0].shape)}"
         if prev_m is not None:
             delta = (m0[0].float() - prev_m[0].float()).abs().max().item()
             assert delta > 0, "memory did not change between frames"

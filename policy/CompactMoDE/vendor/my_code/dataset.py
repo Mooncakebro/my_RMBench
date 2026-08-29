@@ -6,7 +6,6 @@ The dataset returns ordinary PyTorch DataLoader batches with keys:
     robot_obs:    [B, obs_horizon, state_dim]
     rgb_obs:
         rgb_static:  [B, obs_horizon, 3, H, W]
-        rgb_gripper: [B, obs_horizon, 3, H, W]
     lang_text:    list[str]
     task_index:   [B]
     episode_index:[B]
@@ -108,7 +107,7 @@ class LeRobotV3Dataset(Dataset):
         include_images: bool = True,
         image_size: Optional[Tuple[int, int]] = (224, 224),
         image_sizes: Optional[Dict[str, Tuple[int, int]]] = None,
-        image_keys: Tuple[str, str] = ("observation.images.fixed", "observation.images.handeye"),
+        image_keys: Tuple[str, ...] = ("observation.images.fixed",),
         normalize_actions: bool = True,
         normalize_state: bool = True,
         normalize_mode: str = "mean_std",
@@ -169,33 +168,9 @@ class LeRobotV3Dataset(Dataset):
 
         if self.include_images:
             fixed = self._read_image_window(obs_rows, self.image_keys[0], "rgb_static")
-            try:
-                handeye = self._read_image_window(obs_rows, self.image_keys[1], "rgb_gripper")
-            except RuntimeError:
-                if self.corrupt_frame_policy == "fixed":
-                    handeye = F.interpolate(
-                        fixed,
-                        size=self.image_sizes.get("rgb_gripper", self.image_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                elif self.corrupt_frame_policy == "zero":
-                    gripper_size = self.image_sizes.get("rgb_gripper", self.image_size)
-                    if gripper_size is None:
-                        gripper_size = tuple(fixed.shape[-2:])
-                    handeye = torch.zeros(
-                        fixed.shape[0],
-                        fixed.shape[1],
-                        gripper_size[0],
-                        gripper_size[1],
-                        dtype=fixed.dtype,
-                    )
-                else:
-                    raise
         else:
             fixed = torch.empty(0)
-            handeye = torch.empty(0)
-        sample["rgb_obs"] = {"rgb_static": fixed, "rgb_gripper": handeye}
+        sample["rgb_obs"] = {"rgb_static": fixed}
         return sample
 
     @property
@@ -499,18 +474,11 @@ def _smoke_test_v2() -> None:
             if key == "rgb_obs":
                 # Use 'value' (the dict), not 'key' (the string)
                 static_shape = value['rgb_static'].shape
-                gripper_shape = value['rgb_gripper'].shape
                 
-                if static_shape == (1, 3, 224, 224) and gripper_shape == (1, 3, 224, 224):
-                    print(f"Sample {i}: Image shapes are correct.")
-                    pass
-                else:
-                    if static_shape != (1, 3, 224, 224):
-                        print(f"Sample {i}: Unexpected shape for rgb_static: {static_shape}")
-                        return  # Stop the test if the shape is incorrect
-                    if gripper_shape != (1, 3, 224, 224):
-                        print(f"Sample {i}: Unexpected shape for rgb_gripper: {gripper_shape}")
-                        return  # Stop the test if the shape is incorrect
+                if static_shape != (1, 3, 224, 224):
+                    print(f"Sample {i}: Unexpected shape for rgb_static: {static_shape}")
+                    return  # Stop the test if the shape is incorrect
+                print(f"Sample {i}: Image shape is correct.")
 
 
 if __name__ == "__main__":

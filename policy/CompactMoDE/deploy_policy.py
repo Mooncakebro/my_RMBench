@@ -8,10 +8,10 @@ Loaded by script/eval_policy.py. Configuration comes from deploy_policy.yml
     num_sampling_steps: EDM DDIM steps (default 10)
 
 Per eval() call the policy sees ONE observation, samples a full action chunk
-(10 x 14, normalized -> decoded to raw joint targets), and executes it
-open-loop via TASK_ENV.take_action(). The COMPACT variant's memory is updated
-only on eval() calls (i.e. once per executed chunk, not per sim step);
-reset_model() re-initializes it at episode start.
+(10 x 14, normalized -> decoded to raw joint targets), executes only the first
+action, and returns to the RMBench loop for a fresh observation. The COMPACT
+variant memory is updated on every eval() call; reset_model() re-initializes it
+at episode start.
 
 NOTE: untested in the simulator on this dev machine (no SAPIEN env here) —
 verify on the eval server before drawing conclusions.
@@ -79,7 +79,11 @@ class CompactMoDEDeployer:
         else:
             actions = self.policy.sample_actions(batch, steps=self.num_sampling_steps)
         actions = actions[0].float().cpu()  # (chunk, 14) normalized
-        self.prev_action = actions[-1].clone()
+        # The memory controller receives the action that was actually
+        # executed, not the final action from the unexecuted prediction
+        # horizon.  This keeps the next forward step causally aligned with
+        # the environment.
+        self.prev_action = actions[0].clone()
         raw = self.policy.action_normalizer.decode(actions)
         return raw.numpy()
 
@@ -91,9 +95,9 @@ def get_model(usr_args):
 def eval(TASK_ENV, model: CompactMoDEDeployer, observation):
     instruction = TASK_ENV.get_instruction()
     actions = model.get_action_chunk(observation, instruction)
-    for action in actions:
-        TASK_ENV.take_action(action, action_type="qpos")
-        observation = TASK_ENV.get_obs()
+    # Receding-horizon control: predict a 10-step chunk, execute only the
+    # first action, then let the outer RMBench loop observe and replan.
+    TASK_ENV.take_action(actions[0], action_type="qpos")
 
 
 def reset_model(model: CompactMoDEDeployer):

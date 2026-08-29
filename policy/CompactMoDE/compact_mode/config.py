@@ -17,7 +17,7 @@ class CompactMoDEConfig:
     gradient_checkpointing: bool = False
 
     # ── COMPACT side memory (COMPACT variant only) ──
-    mem_dim: int = 16
+    mem_dim: int = 512
     num_mem_tokens: int = 16
     num_heads: int = 8
     num_obs_tokens: int = 4
@@ -73,6 +73,15 @@ class CompactMoDEConfig:
     max_grad_norm: float = 1.0
     chunk_size: int = 8                 # TBPTT chunk length (COMPACT variant)
     seed: int = 42
+
+    def __post_init__(self):
+        if self.mem_dim <= 0:
+            raise ValueError("mem_dim must be positive")
+        if self.num_heads <= 0 or self.mem_dim % self.num_heads != 0:
+            raise ValueError(
+                "mem_dim must be divisible by the COMPACT num_heads "
+                f"(got mem_dim={self.mem_dim}, num_heads={self.num_heads})"
+            )
 
     def to_dict(self) -> dict:
         d = asdict(self)
