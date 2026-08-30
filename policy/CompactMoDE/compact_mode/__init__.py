@@ -26,6 +26,14 @@ _VENDOR_ROOT = Path(__file__).resolve().parent.parent / "vendor"
 JAMEL_COMPACT_ROOT = Path(os.environ.get("JAMEL_COMPACT_ROOT", _VENDOR_ROOT))
 MODE_ROOT = Path(os.environ.get("MODE_ROOT", _VENDOR_ROOT))
 
+_MODE_SENTINEL = MODE_ROOT / "mode" / "models" / "edm_diffusion" / "utils.py"
+if not _MODE_SENTINEL.is_file():
+    raise ModuleNotFoundError(
+        "CompactMoDE's vendored MoDE files are incomplete. Missing: "
+        f"{_MODE_SENTINEL}. Re-sync policy/CompactMoDE/vendor/mode/models/ "
+        "or point MODE_ROOT to a complete MoDE root."
+    )
+
 for _p in (JAMEL_COMPACT_ROOT, MODE_ROOT):
     if _p.exists() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))

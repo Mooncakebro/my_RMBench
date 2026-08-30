@@ -1,5 +1,7 @@
 models/
 !policy/Mem-0/source/models
+!policy/CompactMoDE/vendor/mode/models/
+!policy/CompactMoDE/vendor/mode/models/**
 data/*
 !data/process_stuck.py
 __pycache__/
