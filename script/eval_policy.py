@@ -189,7 +189,8 @@ def main(usr_args):
         # Success Rate
         success_rates = (np.asarray(suc_nums, dtype=float) / float(test_num)).reshape(-1)
         for sr in success_rates:
-            file.write(f"Success Rate: {sr}\n")        file.write(f"Top-{topk} Success Rate: {topk_success_rate}\n")
+            file.write(f"Success Rate: {sr}\n")
+        file.write(f"Top-{topk} Success Rate: {topk_success_rate}\n")
         file.write("\n")  # 分隔一下
 
         # Reward

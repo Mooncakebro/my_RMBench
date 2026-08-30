@@ -1719,8 +1719,8 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
-if (self.eval_video_path is not None and self.eval_video_ffmpeg is not None):
-                frame = self.now_obs.get("third_view_rgb")
+                if (self.eval_video_path is not None and self.eval_video_ffmpeg is not None):
+                    frame = self.now_obs.get("third_view_rgb")
                 if frame is None:
                     frame = self.now_obs["observation"]["head_camera"]["rgb"]
                 self.eval_video_ffmpeg.stdin.write(frame.tobytes())

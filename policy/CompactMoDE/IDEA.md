@@ -12,9 +12,13 @@ manipulation benchmark, SAPIEN sim, AgileX Cobot Magic / aloha-agilex embodiment
 
 - **COMPACT-2B** (`/home/spc/JAMEL-COMPACT`): Qwen3-VL-2B-Instruct + per-layer
   recurrent side memory (Kalman-filter-style predict→correct→inject; 16 slots ×
-  512-dim per layer × 28 layers), and
+  mem_dim per layer × 28 layers), and
 - **MoDE DiT action head** (`/home/spc/MoDE_Diffusion_Policy`): EDM diffusion
   (Karras preconditioning) with a Mixture-of-Denoising-Experts transformer.
+
+`mem_dim` is **configurable** (owner plans a sweep from 8 to 512; current
+default **128**, COMPACT's original default is 512). `num_mem_tokens` stays 16,
+`num_heads` stays 8 — mem_dim must be divisible by num_heads.
 
 RMBench tasks are memory-dependent (M(1): remember one past event; M(n):
 multi-stage memory). The hypothesis: COMPACT's persistent side memory should beat
@@ -67,10 +71,18 @@ No "stage A / stage B" staged training plan — just the two models.
    Side memory gets its own small LR (5e-6); base gets base_lr (1e-5);
    bridge+DiT get lr (1e-4).
 10. **Camera**: head camera only (matches Mem-0; keeps token count sane).
+11. **Deployment: receding-horizon (MPC-style) execution.** Each `eval()` call
+    predicts a full 10-step action chunk but executes ONLY the first action,
+    then the RMBench loop observes again and re-plans. The COMPACT memory state
+    updates on every model forward (i.e. every executed step), and the memory
+    controller receives the action that was actually executed
+    (`actions[0]`, normalized).
 
 ## Data
 
-- Source: RMBench `demo_clean` HDF5 (symlinked at `RMBench/data/<task>`).
+- Source: RMBench `demo_clean` HDF5 (symlinked at `RMBench/data/<task>` →
+  `/media/spc/新加卷/RMBench_dataset/data/<task>`; assets likewise →
+  `RMBench_dataset/{embodiments,objects}`).
 - Converted to LeRobot v3 at `RMBench/data_lerobot/<task>/` (12 tasks × 50
   episodes) by `policy/CompactMoDE/scripts/hdf5_to_lerobot_v3.py`:
   head-cam mp4 (240×320@30fps), `action[t] = joint_action/vector[t+1]`,

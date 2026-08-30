@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
     p.add_argument("--base-lr", type=float, default=float(os.environ.get("BASE_LR", "1e-5")))
     p.add_argument("--memory-lr", type=float, default=float(os.environ.get("MEMORY_LR", "5e-6")))
-    p.add_argument("--mem-dim", type=int, default=int(os.environ.get("MEM_DIM", "512")))
+    p.add_argument("--mem-dim", type=int, default=int(os.environ.get("MEM_DIM", "128")))
     p.add_argument("--weight-decay", type=float, default=float(os.environ.get("WD", "0.01")))
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine")
