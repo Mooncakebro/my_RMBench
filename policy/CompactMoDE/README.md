@@ -128,8 +128,11 @@ Notes:
 - Scripts are single-process. For multi-GPU, launch one process per GPU with
   different `CUDA_VISIBLE_DEVICES` + `TASK`, or wrap in torchrun (DDP wiring is
   not implemented yet — the training loops are deliberately simple).
-- Checkpoints: `runs/<variant>_<task>/ckpt_*.pt` (resumable via `--resume`) and
-  `final/` (deployment format via `save_pretrained`).
+- Checkpoints: only `best/` and `final/` deployment-format directories are saved;
+  `best/` is the lowest observed training chunk loss and `final/` is the last
+  step. `training_summary.json` records the best step/loss. Periodic optimizer
+  checkpoints are disabled to limit disk usage; new runs cannot be resumed
+  unless an older `.pt` checkpoint is supplied explicitly with `--resume`.
 
 ## Eval (RMBench sim, run on the eval machine)
 

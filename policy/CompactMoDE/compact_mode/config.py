@@ -17,7 +17,7 @@ class CompactMoDEConfig:
     gradient_checkpointing: bool = False
 
     # ── COMPACT side memory (COMPACT variant only) ──
-    mem_dim: int = 512
+    mem_dim: int = 128
     num_mem_tokens: int = 16
     num_heads: int = 8
     num_obs_tokens: int = 4

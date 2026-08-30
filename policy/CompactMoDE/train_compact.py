@@ -23,6 +23,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -70,7 +71,11 @@ def parse_args():
     p.add_argument("--num-experts", type=int, default=int(os.environ.get("NUM_EXPERTS", "4")))
     p.add_argument("--top-k", type=int, default=int(os.environ.get("TOP_K", "2")))
     p.add_argument("--log-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=int(os.environ.get("SAVE_STEPS", "1000")))
+    p.add_argument(
+        "--save-steps", type=int,
+        default=int(os.environ.get("SAVE_STEPS", "0")),
+        help="Deprecated compatibility option; periodic checkpoints are disabled.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--mem-opt", choices=("adamw", "sgd"),
@@ -97,16 +102,16 @@ def make_lr_lambda(total_steps: int, warmup_ratio: float, schedule: str):
     return lr_lambda
 
 
-def save_checkpoint(path, model, optimizers, step, cfg):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not isinstance(optimizers, (list, tuple)):
-        optimizers = [optimizers]
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": [o.state_dict() for o in optimizers],
-        "step": step,
-        "config": cfg.to_dict(),
-    }, path)
+def save_policy_weights(path: Path, model: CompactMoDEPolicy) -> None:
+    """Atomically replace a deployment-format policy directory."""
+    path = Path(path)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    if temp_path.exists():
+        shutil.rmtree(temp_path)
+    model.save_pretrained(temp_path)
+    if path.exists():
+        shutil.rmtree(path)
+    temp_path.replace(path)
 
 
 def main():
@@ -178,6 +183,8 @@ def main():
 
     model.train()
     memory = model.init_memory(args.num_streams, device)
+    best_loss = float("inf")
+    best_step = 0
     for step in range(start_step, args.max_steps):
         t0 = time.time()
         chunk, resets = sampler.next_chunk()
@@ -204,18 +211,31 @@ def main():
 
         # TBPTT: detach carried state at the chunk boundary.
         memory = model.detach_memory(memory)
+        step_num = step + 1
+        loss_value = float(chunk_loss.detach().cpu())
 
-        if (step + 1) % args.log_steps == 0:
+        if math.isfinite(loss_value) and loss_value < best_loss:
+            best_loss = loss_value
+            best_step = step_num
+            save_policy_weights(args.output_dir / "best", model)
+            print(f"[train] new best loss {best_loss:.4f} at step {best_step}")
+
+        if step_num % args.log_steps == 0:
             parts = " ".join(f"{k} {v:.4f}" for k, v in log_parts.items())
-            print(f"[train] step {step + 1}/{args.max_steps} loss {chunk_loss.item():.4f} "
+            print(f"[train] step {step_num}/{args.max_steps} loss {loss_value:.4f} "
                   f"({parts}) lr {schedulers[0].get_last_lr()[0]:.2e} ({time.time() - t0:.2f}s)")
-        if (step + 1) % args.save_steps == 0:
-            save_checkpoint(args.output_dir / f"ckpt_{step + 1:07d}.pt",
-                            model, optimizers, step + 1, cfg)
 
-    save_checkpoint(args.output_dir / "ckpt_final.pt", model, optimizers, args.max_steps, cfg)
-    model.save_pretrained(args.output_dir / "final")
-    print(f"[train] done. {args.max_steps} steps. Saved to {args.output_dir}")
+    save_policy_weights(args.output_dir / "final", model)
+    summary = {
+        "best_step": best_step,
+        "best_loss": best_loss if math.isfinite(best_loss) else None,
+        "final_step": args.max_steps,
+        "checkpoint_policy": "best and final deployment weights only",
+    }
+    (args.output_dir / "training_summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n"
+    )
+    print(f"[train] done. {args.max_steps} steps. Saved best and final to {args.output_dir}")
 
 
 if __name__ == "__main__":
