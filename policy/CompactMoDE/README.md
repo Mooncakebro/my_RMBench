@@ -205,5 +205,8 @@ pip install setuptools==69.5.1
 
 python -m pip install ninja
 
+python -m pip install --force-reinstall "setuptools<81"
+
+
 
 ```
