@@ -5,7 +5,7 @@ echo "Installing pytorch3d ..."
 # cd third_party/pytorch3d_simplified
 # pip install -e .
 # cd ../..
-pip install -i "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
 
 echo "Adjusting code in sapien/wrapper/urdf_loader.py ..."
 # location of sapien, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/sapien"
@@ -50,7 +50,7 @@ echo "Installing Curobo ..."
 cd envs
 git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git
 cd curobo
-pip install -i -e . --no-build-isolation
+pip install -e . --no-build-isolation
 cd ../..
 
 echo "Installation basic environment complete!"
