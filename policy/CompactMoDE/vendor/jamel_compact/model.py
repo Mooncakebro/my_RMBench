@@ -453,11 +453,17 @@ class JAMELCompactWrapper(nn.Module):
         # We try causal first (for text-only models like Qwen3-8B), then fall
         # back to ImageTextToText (for vision-language models like Qwen3-VL).
         dtype = torch.bfloat16 if config.bf16 else torch.float32
+        config.base_model_name = str(config.base_model_name).rstrip("/\\")
         load_kwargs = {
-            "torch_dtype": dtype,
+            "dtype": dtype,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
         }
+        print(
+            f"[model] loading base model from {config.base_model_name} "
+            f"with dtype={dtype}",
+            flush=True,
+        )
         if config.model_parallel:
             try:
                 import accelerate
@@ -482,6 +488,7 @@ class JAMELCompactWrapper(nn.Module):
                 config.base_model_name,
                 **load_kwargs,
             )
+        print("[model] base model weights loaded", flush=True)
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 config.base_model_name, trust_remote_code=True,
@@ -494,6 +501,7 @@ class JAMELCompactWrapper(nn.Module):
             )
         except Exception:
             self.processor = None
+        print("[model] tokenizer and processor loaded", flush=True)
 
         # ── Infer architecture ──
         self.hidden_dim = self._infer_hidden_size(self.llm)

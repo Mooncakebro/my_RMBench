@@ -129,8 +129,9 @@ Notes:
   different `CUDA_VISIBLE_DEVICES` + `TASK`, or wrap in torchrun (DDP wiring is
   not implemented yet — the training loops are deliberately simple).
 - Checkpoints: only `best/` and `final/` deployment-format directories are saved;
-  `best/` is the lowest observed training chunk loss and `final/` is the last
-  step. `training_summary.json` records the best step/loss. Periodic optimizer
+  `best/` is selected from periodic training-loss checks (`BEST_SAVE_STEPS`,
+  default 500) and `final/` is the last step. `training_summary.json` records
+  the best step/loss. Periodic optimizer
   checkpoints are disabled to limit disk usage; new runs cannot be resumed
   unless an older `.pt` checkpoint is supplied explicitly with `--resume`.
 

@@ -76,6 +76,11 @@ def parse_args():
         default=int(os.environ.get("SAVE_STEPS", "0")),
         help="Deprecated compatibility option; periodic checkpoints are disabled.",
     )
+    p.add_argument(
+        "--best-save-steps", type=int,
+        default=int(os.environ.get("BEST_SAVE_STEPS", "500")),
+        help="Evaluate and overwrite best/ at this step interval.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--mem-opt", choices=("adamw", "sgd"),
@@ -116,7 +121,13 @@ def save_policy_weights(path: Path, model: CompactMoDEPolicy) -> None:
 
 def main():
     args = parse_args()
+    args.base_model = str(args.base_model).rstrip("/\\")
     device = torch.device(args.device)
+    print(
+        f"[startup] device={device} task={args.task} data_root={args.data_root} "
+        f"base_model={args.base_model}",
+        flush=True,
+    )
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -146,14 +157,20 @@ def main():
         seed=args.seed,
     )
 
+    print("[startup] loading converted dataset", flush=True)
     dataset = FrameDataset(args.data_root / args.task, action_horizon=cfg.action_seq_len,
                            normalize=cfg.normalize)
+    print(f"[startup] dataset ready: {len(dataset)} training frames", flush=True)
     sampler = EpisodeStreamSampler(
         dataset, chunk_size=cfg.chunk_size, num_streams=args.num_streams,
         shuffle_episodes=True, seed=args.seed,
         max_frames_per_episode=args.max_frames_per_episode or None)
 
-    model = CompactMoDEPolicy(cfg).to(device)
+    print("[startup] constructing CompactMoDE policy", flush=True)
+    model = CompactMoDEPolicy(cfg)
+    print(f"[startup] moving policy to {device}", flush=True)
+    model = model.to(device)
+    print("[startup] policy is ready on the training device", flush=True)
     model.set_normalizers(dataset.action_normalizer, dataset.state_normalizer)
     counts = model.trainable_param_counts()
     print(f"[train] param counts: {counts}")
@@ -214,17 +231,23 @@ def main():
         step_num = step + 1
         loss_value = float(chunk_loss.detach().cpu())
 
-        if math.isfinite(loss_value) and loss_value < best_loss:
+        check_best = args.best_save_steps > 0 and step_num % args.best_save_steps == 0
+        if check_best and math.isfinite(loss_value) and loss_value < best_loss:
             best_loss = loss_value
             best_step = step_num
             save_policy_weights(args.output_dir / "best", model)
-            print(f"[train] new best loss {best_loss:.4f} at step {best_step}")
+            print(f"[train] new checkpointed best loss {best_loss:.4f} at step {best_step}")
 
         if step_num % args.log_steps == 0:
             parts = " ".join(f"{k} {v:.4f}" for k, v in log_parts.items())
             print(f"[train] step {step_num}/{args.max_steps} loss {loss_value:.4f} "
                   f"({parts}) lr {schedulers[0].get_last_lr()[0]:.2e} ({time.time() - t0:.2f}s)")
 
+    if best_step == 0 or (math.isfinite(loss_value) and loss_value < best_loss):
+        best_loss = loss_value
+        best_step = args.max_steps
+        save_policy_weights(args.output_dir / "best", model)
+        print(f"[train] final step selected as best with loss {best_loss:.4f}")
     save_policy_weights(args.output_dir / "final", model)
     summary = {
         "best_step": best_step,
