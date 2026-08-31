@@ -5,7 +5,7 @@ echo "Installing pytorch3d ..."
 # cd third_party/pytorch3d_simplified
 # pip install -e .
 # cd ../..
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
 
 echo "Adjusting code in sapien/wrapper/urdf_loader.py ..."
 # location of sapien, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/sapien"

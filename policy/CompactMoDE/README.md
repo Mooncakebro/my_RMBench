@@ -165,3 +165,45 @@ environment step.)
 - transformers 4.57.6 quirks handled in code: `get_image_features` returns a
   plain tuple; the processor never emits `mm_token_type_ids` (we build it).
 - `torch_dtype` deprecation warning from transformers is harmless.
+
+## Trouble shooting
+### Insatll Env for COMPACT-MoDE Trainig:
+```bash
+conda create -y -n lerobot python=3.10                    # 创建一个名为lerobot的python3.10环境
+conda activate lerobot                                    # 激活名为lerobot的python3环境
+conda install ffmpeg -c conda-forge                       # conda安装ffmpeg库，不装很多示例会直接报错。
+pip install lerobot                                       # 安装lerobot，从库中安装，不从源码安装
+pip install "lerobot[aloha]"                              # 安装lerobot额外的依赖 alpha 模拟环境
+pip install "lerobot[metaworld]"                          # 安装lerobot额外的依赖 metaworld 基准测试
+pip install "lerobot[feetech]"                            # 安装lerobot额外的依赖 feetech
+pip install "lerobot[smolvla]"                            # 安装lerobot额外的依赖 smolvla
+
+pip install omegaconf hydra-core
+```
+
+### Insatll Env for Eval:
+```bash
+conda create -n RMBench python=3.10 -y
+
+conda activate RMBench
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+bash script/_install_tsinghuayuan.sh
+
+python -m pip install \
+    "transformers==4.57.6" \
+    accelerate \
+    qwen-vl-utils \
+    "hydra-core==1.1.1" \
+    "omegaconf==2.1.2" \
+    pandas \
+    pyarrow \
+    av
+
+pip install setuptools==69.5.1
+
+python -m pip install ninja
+
+
+```
