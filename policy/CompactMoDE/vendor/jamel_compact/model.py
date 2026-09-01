@@ -310,10 +310,11 @@ class SideMemoryModule(nn.Module):
         # ── U3: Observation model — predict what we'll see ──
         z_pred = self.obs_model(m_hat.mean(dim=1))  # [B, d_mem]
         z_target = z_mean.detach()  # [B, d_mem]
-        e_per_sample = F.mse_loss(z_pred, z_target, reduction='none').mean(dim=-1)  # [B]
+        # .float(): bf16 mse_loss is not implemented on CPU (local CPU eval).
+        e_per_sample = F.mse_loss(z_pred.float(), z_target.float(), reduction='none').mean(dim=-1)  # [B]
 
         # L_obs: trains the observation model
-        loss_obs = F.mse_loss(z_pred, z_target)
+        loss_obs = F.mse_loss(z_pred.float(), z_target.float())
 
         # L_nll: Gaussian NLL calibrates R against actual surprise.
         # NOTE: e_per_sample is ALREADY the squared residual (per-sample MSE),

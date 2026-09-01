@@ -138,17 +138,15 @@ class Robot:
         self._init_robot_(scene, need_topp, **kwargs)
 
         if self.communication_flag:
-            if not self._planner_workers_alive():
-                print("[robot] restarting an exited CuRobo planner worker", flush=True)
+            try:
+                self._reset_planner_workers(scene)
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                print(
+                    f"[robot] planner pipe closed during reset ({exc}); restarting workers",
+                    flush=True,
+                )
                 self._stop_planner_workers()
                 self.set_planner(scene=scene)
-            else:
-                if hasattr(self, "left_conn") and self.left_conn:
-                    self.left_conn.send({"cmd": "reset"})
-                    self._receive_planner_response(self.left_conn, "left")
-                if hasattr(self, "right_conn") and self.right_conn:
-                    self.right_conn.send({"cmd": "reset"})
-                    self._receive_planner_response(self.right_conn, "right")
         else:
             if not isinstance(self.left_planner, CuroboPlanner) or (self.is_dual_arm and not isinstance(self.right_planner, CuroboPlanner)):
                 self.set_planner(scene=scene)
@@ -373,6 +371,18 @@ class Robot:
             and getattr(self, f"{arm_tag}_proc").is_alive()
             for arm_tag in ("left", "right")
         )
+
+    def _reset_planner_workers(self, scene=None):
+        if not self._planner_workers_alive():
+            print("[robot] restarting an exited CuRobo planner worker", flush=True)
+            self._stop_planner_workers()
+            self.set_planner(scene=scene)
+            return
+
+        self.left_conn.send({"cmd": "reset"})
+        self._receive_planner_response(self.left_conn, "left")
+        self.right_conn.send({"cmd": "reset"})
+        self._receive_planner_response(self.right_conn, "right")
 
     def _stop_planner_workers(self):
         for arm_tag in ("left", "right"):

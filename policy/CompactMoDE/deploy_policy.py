@@ -62,18 +62,12 @@ class CompactMoDEDeployer:
             torch.cuda.empty_cache()
 
     def _cpu_cfg_override(self, variant):
-        """bf16 ops (e.g. mse_loss in the memory correct step) are not
-        implemented on CPU — fall back to fp32 weights when device=cpu.
-        NB: load_pretrained applies the override field-by-field over the
-        checkpoint config, so start from the checkpoint's own cfg and flip
-        only bf16 (a fresh default cfg would clobber the DiT architecture)."""
-        if self.device.type != "cpu":
-            return None
-        from compact_mode.config import CompactMoDEConfig
-        cfg = CompactMoDEConfig.load_json(
-            Path(self._ckpt) / "compact_mode_config.json")
-        cfg.bf16 = False
-        return cfg
+        """Keep the checkpoint config as-is. We deliberately do NOT flip
+        bf16->fp32 on CPU: the dev machine has only 16GB RAM and fp32
+        weights (~8.6GB) get OOM-killed. bf16 works on CPU except for a few
+        ops (e.g. mse_loss), which are cast to fp32 at the call site in
+        vendor/jamel_compact/model.py."""
+        return None
 
     def reset(self):
         self.memory = None
