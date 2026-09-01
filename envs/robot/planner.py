@@ -8,6 +8,14 @@ import toppra as ta
 from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
 import transforms3d as t3d
 import envs._GLOBAL_CONFIGS as CONFIGS
+from types import SimpleNamespace
+
+try:
+    import warp as _warp
+    if not hasattr(_warp, "torch") and hasattr(_warp, "device_from_torch"):
+        _warp.torch = SimpleNamespace(device_from_torch=_warp.device_from_torch)
+except ImportError:
+    pass
 
 
 try:
