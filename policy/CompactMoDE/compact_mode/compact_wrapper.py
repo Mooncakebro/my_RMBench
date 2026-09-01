@@ -170,6 +170,12 @@ class CompactModeWrapper(JAMELCompactWrapper):
             else:
                 h_layer = layer_output
 
+            # Defensive dtype alignment (no-op when already consistent):
+            # bf16/fp32 mixes slip through on CPU where there is no fused
+            # attention path to hide them.
+            m_hat = m_hat.to(h_layer.dtype)
+            p_hat = p_hat.to(h_layer.dtype)
+
             # 4b.5 DeepStack injection (Qwen3-VL adds visual features to
             #      early decoder layers' hidden states at image positions)
             if deepstack_features and l < len(deepstack_features):
@@ -194,6 +200,10 @@ class CompactModeWrapper(JAMELCompactWrapper):
             )
 
             # 4e. Memory Inject (F4: zero-init gated)
+            # Defensive dtype alignment: mixed bf16/fp32 slips through on
+            # CPU (CUDA's fused attention path tolerates it silently).
+            m_new = m_new.to(h_layer.dtype)
+            p_new = p_new.to(h_layer.dtype)
             h = sm.inject(h_layer, m_new)
 
             new_memory.append(m_new)
