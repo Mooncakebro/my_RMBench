@@ -162,6 +162,33 @@ else
     pass "No known stale asset paths found"
 fi
 
+WARP_INFO=$(python - <<'PY'
+try:
+    import warp as wp
+    version = getattr(getattr(wp, "config", None), "version", "unknown")
+    has_top_level = hasattr(wp, "device_from_torch")
+    has_submodule = hasattr(wp, "torch") and hasattr(wp.torch, "device_from_torch")
+    print(version)
+    print("1" if has_top_level else "0")
+    print("1" if has_submodule else "0")
+except Exception as exc:
+    print(f"ERROR:{type(exc).__name__}:{exc}")
+PY
+)
+if [[ "$WARP_INFO" == ERROR:* ]]; then
+    fail "Warp import failed: ${WARP_INFO#ERROR:}"
+else
+    WARP_VERSION=$(printf '%s\n' "$WARP_INFO" | sed -n '1p')
+    WARP_TOP_LEVEL=$(printf '%s\n' "$WARP_INFO" | sed -n '2p')
+    WARP_SUBMODULE=$(printf '%s\n' "$WARP_INFO" | sed -n '3p')
+    pass "Warp imported: $WARP_VERSION"
+    if [ "$WARP_TOP_LEVEL" = "1" ] || [ "$WARP_SUBMODULE" = "1" ]; then
+        pass "Warp has a CuRobo-compatible Torch interop API"
+    else
+        fail "Warp has neither device_from_torch API nor warp.torch.device_from_torch"
+    fi
+fi
+
 if python - <<'PY'
 import importlib.util
 raise SystemExit(0 if importlib.util.find_spec("pkg_resources") else 1)

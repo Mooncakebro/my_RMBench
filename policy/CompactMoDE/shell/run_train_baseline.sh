@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 TASK=${TASK:-swap_blocks}
 # Auto-detect repo root (parent of policy/)
-REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
 DATA_ROOT=${DATA_ROOT:-$REPO_ROOT/data_lerobot}
 OUTPUT_DIR=${OUTPUT_DIR:-$(pwd)/runs/baseline_${TASK}}
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-VL-2B-Instruct}

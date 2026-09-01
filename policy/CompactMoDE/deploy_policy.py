@@ -33,16 +33,22 @@ class CompactMoDEDeployer:
     def __init__(self, usr_args):
         variant = str(usr_args.get("variant", "compact")).lower()
         ckpt = usr_args["checkpoint_path"]
+        self._ckpt = ckpt
         steps = int(usr_args.get("num_sampling_steps", 10))
         self.num_sampling_steps = steps
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Local dev on small GPUs: pass --device cpu to keep the VLM off the
+        # GPU so SAPIEN's ray-tracing buffers fit in VRAM (slow but works).
+        default_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(str(usr_args.get("device", default_device)))
 
         if variant == "compact":
             from compact_mode.model_compact import CompactMoDEPolicy
-            self.policy = CompactMoDEPolicy.load_pretrained(ckpt, device=str(self.device))
+            self.policy = CompactMoDEPolicy.load_pretrained(
+                ckpt, cfg_override=self._cpu_cfg_override(variant), device=str(self.device))
         elif variant == "baseline":
             from compact_mode.model_baseline import BaselineQwenMoDEPolicy
-            self.policy = BaselineQwenMoDEPolicy.load_pretrained(ckpt, device=str(self.device))
+            self.policy = BaselineQwenMoDEPolicy.load_pretrained(
+                ckpt, cfg_override=self._cpu_cfg_override(variant), device=str(self.device))
         else:
             raise ValueError(f"unknown variant: {variant}")
         self.policy.eval()
@@ -50,6 +56,20 @@ class CompactMoDEDeployer:
         self.memory = None
         self.prev_action = None  # normalized (14,)
         self.action_dim = self.policy.cfg.action_dim
+
+    def _cpu_cfg_override(self, variant):
+        """bf16 ops (e.g. mse_loss in the memory correct step) are not
+        implemented on CPU — fall back to fp32 weights when device=cpu.
+        NB: load_pretrained applies the override field-by-field over the
+        checkpoint config, so start from the checkpoint's own cfg and flip
+        only bf16 (a fresh default cfg would clobber the DiT architecture)."""
+        if self.device.type != "cpu":
+            return None
+        from compact_mode.config import CompactMoDEConfig
+        cfg = CompactMoDEConfig.load_json(
+            Path(self._ckpt) / "compact_mode_config.json")
+        cfg.bf16 = False
+        return cfg
 
     def reset(self):
         self.memory = None

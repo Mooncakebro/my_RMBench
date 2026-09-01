@@ -191,6 +191,22 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 bash script/_install_tsinghuayuan.sh
 
+'''
+if fail to install pytorch3d and curobo, do:
+
+git clone --branch stable https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d
+cd /tmp/pytorch3d
+pip install -e . --no-build-isolation
+
+# 手动 clone（指定 tag 和浅克隆）
+git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git
+
+# 确认目录存在后再进入
+cd curobo
+pip install -e . --no-build-isolation
+cd ../..
+'''
+
 python -m pip install \
     "transformers==4.57.6" \
     accelerate \
@@ -203,7 +219,7 @@ python -m pip install \
 
 pip install setuptools==69.5.1
 
-python -m pip install ninja
+python -m pip install ninja einops
 
 python -m pip install --force-reinstall "setuptools<81"
 
