@@ -159,7 +159,7 @@ def build_dit_denoiser(cfg: CompactMoDEConfig, device: str) -> GCDenoiser:
 
 
 class BaselineQwenMoDEPolicy(nn.Module):
-    def __init__(self, cfg: CompactMoDEConfig):
+    def __init__(self, cfg: CompactMoDEConfig, processor_source: Optional[str] = None):
         super().__init__()
         self.cfg = cfg
         from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -183,7 +183,7 @@ class BaselineQwenMoDEPolicy(nn.Module):
         assert not missing, f"checkpoint failed to load; missing keys: {missing[:5]} ..."
         self._has_lm_head = True
         self.processor = AutoProcessor.from_pretrained(
-            cfg.base_model_name, trust_remote_code=True)
+            processor_source or cfg.base_model_name, trust_remote_code=True)
         self.image_token_id = int(getattr(self.llm.config, "image_token_id",
                                           self.processor.image_token_id))
         self.hidden_dim = _infer_hidden_dim(self.llm)
@@ -314,6 +314,7 @@ class BaselineQwenMoDEPolicy(nn.Module):
             (save_path / "base_model_ref.txt").write_text(self.cfg.base_model_name)
         else:
             self.llm.save_pretrained(save_path / "base_model")
+        self.processor.save_pretrained(save_path)
         print(f"[save] BaselineQwenMoDEPolicy saved to {save_path}")
 
     @classmethod
@@ -325,9 +326,13 @@ class BaselineQwenMoDEPolicy(nn.Module):
             for k, v in cfg_override.to_dict().items():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
+        processor_source = str(load_path) if (
+            (load_path / "preprocessor_config.json").exists()
+            or (load_path / "processor_config.json").exists()
+        ) else cfg.base_model_name
         if (load_path / "base_model").exists():
             cfg.base_model_name = str(load_path / "base_model")
-        model = cls(cfg)
+        model = cls(cfg, processor_source=processor_source)
         modules = torch.load(load_path / "policy_modules.pt", map_location="cpu", weights_only=False)
         model.bridge.load_state_dict(modules["bridge"])
         model.denoiser.load_state_dict(modules["denoiser"])
