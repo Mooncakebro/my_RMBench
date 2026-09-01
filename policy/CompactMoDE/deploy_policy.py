@@ -56,6 +56,10 @@ class CompactMoDEDeployer:
         self.memory = None
         self.prev_action = None  # normalized (14,)
         self.action_dim = self.policy.cfg.action_dim
+        if self.device.type == "cuda":
+            # Free allocator-reserved blocks so SAPIEN's Vulkan/RT buffers
+            # can coexist with the policy on small GPUs (8GB dev card).
+            torch.cuda.empty_cache()
 
     def _cpu_cfg_override(self, variant):
         """bf16 ops (e.g. mse_loss in the memory correct step) are not

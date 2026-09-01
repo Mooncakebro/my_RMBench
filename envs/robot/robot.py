@@ -1,6 +1,8 @@
 import sapien.core as sapien
 import numpy as np
 import pdb
+import time
+import traceback
 from .planner import MplibPlanner
 import numpy as np
 import toppra as ta
@@ -136,12 +138,17 @@ class Robot:
         self._init_robot_(scene, need_topp, **kwargs)
 
         if self.communication_flag:
-            if hasattr(self, "left_conn") and self.left_conn:
-                self.left_conn.send({"cmd": "reset"})
-                _ = self.left_conn.recv()
-            if hasattr(self, "right_conn") and self.right_conn:
-                self.right_conn.send({"cmd": "reset"})
-                _ = self.right_conn.recv()
+            if not self._planner_workers_alive():
+                print("[robot] restarting an exited CuRobo planner worker", flush=True)
+                self._stop_planner_workers()
+                self.set_planner(scene=scene)
+            else:
+                if hasattr(self, "left_conn") and self.left_conn:
+                    self.left_conn.send({"cmd": "reset"})
+                    self._receive_planner_response(self.left_conn, "left")
+                if hasattr(self, "right_conn") and self.right_conn:
+                    self.right_conn.send({"cmd": "reset"})
+                    self._receive_planner_response(self.right_conn, "right")
         else:
             if not isinstance(self.left_planner, CuroboPlanner) or (self.is_dual_arm and not isinstance(self.right_planner, CuroboPlanner)):
                 self.set_planner(scene=scene)
@@ -325,6 +332,8 @@ class Robot:
 
             self.left_proc.start()
             self.right_proc.start()
+            self._wait_for_planner_ready(self.left_conn, self.left_proc, "left")
+            self._wait_for_planner_ready(self.right_conn, self.right_proc, "right")
 
         if self.need_topp:
             self.left_mplib_planner = MplibPlanner(
@@ -347,6 +356,68 @@ class Robot:
                     scene,
                 )
 
+    def _check_planner_process(self, arm_tag):
+        process = getattr(self, f"{arm_tag}_proc", None)
+        if process is None:
+            raise RuntimeError(f"{arm_tag} CuRobo planner process was not created")
+        if not process.is_alive():
+            raise RuntimeError(
+                f"{arm_tag} CuRobo planner process exited before the next command "
+                f"(exitcode={process.exitcode}). Check the child-process traceback above; "
+                "negative exit codes usually indicate a native crash or OOM kill."
+            )
+
+    def _planner_workers_alive(self):
+        return all(
+            getattr(self, f"{arm_tag}_proc", None) is not None
+            and getattr(self, f"{arm_tag}_proc").is_alive()
+            for arm_tag in ("left", "right")
+        )
+
+    def _stop_planner_workers(self):
+        for arm_tag in ("left", "right"):
+            process = getattr(self, f"{arm_tag}_proc", None)
+            if process is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+            connection = getattr(self, f"{arm_tag}_conn", None)
+            if connection is not None:
+                try:
+                    connection.close()
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+
+    @staticmethod
+    def _receive_planner_response(conn, arm_tag):
+        response = conn.recv()
+        if isinstance(response, dict) and "error" in response:
+            raise RuntimeError(f"{arm_tag} CuRobo planner failed:\n{response['error']}")
+        return response
+
+    @staticmethod
+    def _wait_for_planner_ready(conn, process, arm_tag):
+        timeout = float(os.environ.get("CUROBO_PLANNER_STARTUP_TIMEOUT", "300"))
+        deadline = time.monotonic() + timeout
+        while not conn.poll(1.0):
+            if not process.is_alive():
+                raise RuntimeError(
+                    f"{arm_tag} CuRobo planner process exited during startup "
+                    f"(exitcode={process.exitcode}). Check the child-process traceback above."
+                )
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.join(timeout=5)
+                raise RuntimeError(
+                    f"{arm_tag} CuRobo planner did not become ready within "
+                    f"{timeout:.0f} seconds"
+                )
+        response = conn.recv()
+        if isinstance(response, dict) and "error" in response:
+            raise RuntimeError(f"{arm_tag} CuRobo planner startup failed:\n{response['error']}")
+        if response != "ready":
+            raise RuntimeError(f"{arm_tag} CuRobo planner returned invalid startup response: {response!r}")
+
     def update_world_pcd(self, world_pcd):
         try:
             self.left_planner.update_point_cloud(world_pcd, resolution=0.02)
@@ -367,15 +438,17 @@ class Robot:
 
     def left_plan_grippers(self, now_val, target_val):
         if self.communication_flag:
+            self._check_planner_process("left")
             self.left_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
-            return self.left_conn.recv()
+            return self._receive_planner_response(self.left_conn, "left")
         else:
             return self.left_planner.plan_grippers(now_val, target_val)
 
     def right_plan_grippers(self, now_val, target_val):
         if self.communication_flag:
+            self._check_planner_process("right")
             self.right_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
-            return self.right_conn.recv()
+            return self._receive_planner_response(self.right_conn, "right")
         else:
             return self.right_planner.plan_grippers(now_val, target_val)
 
@@ -398,6 +471,7 @@ class Robot:
             target_lst_copy[i] = self._trans_from_gripper_to_endlink(target_lst_copy[i], arm_tag="left")
 
         if self.communication_flag:
+            self._check_planner_process("left")
             self.left_conn.send({
                 "cmd": "plan_batch",
                 "qpos": now_qpos,
@@ -405,7 +479,7 @@ class Robot:
                 "constraint_pose": constraint_pose,
                 "arms_tag": "left",
             })
-            return self.left_conn.recv()
+            return self._receive_planner_response(self.left_conn, "left")
         else:
             return self.left_planner.plan_batch(
                 now_qpos,
@@ -433,6 +507,7 @@ class Robot:
             target_lst_copy[i] = self._trans_from_gripper_to_endlink(target_lst_copy[i], arm_tag="right")
 
         if self.communication_flag:
+            self._check_planner_process("right")
             self.right_conn.send({
                 "cmd": "plan_batch",
                 "qpos": now_qpos,
@@ -440,7 +515,7 @@ class Robot:
                 "constraint_pose": constraint_pose,
                 "arms_tag": "right",
             })
-            return self.right_conn.recv()
+            return self._receive_planner_response(self.right_conn, "right")
         else:
             return self.right_planner.plan_batch(
                 now_qpos,
@@ -467,6 +542,7 @@ class Robot:
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="left")
 
         if self.communication_flag:
+            self._check_planner_process("left")
             self.left_conn.send({
                 "cmd": "plan_path",
                 "qpos": now_qpos,
@@ -474,7 +550,7 @@ class Robot:
                 "constraint_pose": constraint_pose,
                 "arms_tag": "left",
             })
-            return self.left_conn.recv()
+            return self._receive_planner_response(self.left_conn, "left")
         else:
             return self.left_planner.plan_path(
                 now_qpos,
@@ -501,6 +577,7 @@ class Robot:
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="right")
 
         if self.communication_flag:
+            self._check_planner_process("right")
             self.right_conn.send({
                 "cmd": "plan_path",
                 "qpos": now_qpos,
@@ -508,7 +585,7 @@ class Robot:
                 "constraint_pose": constraint_pose,
                 "arms_tag": "right",
             })
-            return self.right_conn.recv()
+            return self._receive_planner_response(self.right_conn, "right")
         else:
             return self.right_planner.plan_path(
                 now_qpos,
@@ -695,10 +772,25 @@ class Robot:
 
 
 def planner_process_worker(conn, args):
-    import os
-    from .planner import CuroboPlanner  # 或者绝对路径导入
-
-    planner = CuroboPlanner(args["origin_pose"], args["joints_name"], args["all_joints"], yml_path=args["yml_path"])
+    try:
+        from .planner import CuroboPlanner
+        planner = CuroboPlanner(
+            args["origin_pose"],
+            args["joints_name"],
+            args["all_joints"],
+            yml_path=args["yml_path"],
+        )
+        conn.send("ready")
+    except BaseException:
+        error_text = traceback.format_exc()
+        traceback.print_exc()
+        try:
+            conn.send({"error": error_text})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            conn.close()
+        return
 
     while True:
         try:
@@ -746,4 +838,7 @@ def planner_process_worker(conn, args):
         except EOFError:
             break
         except Exception as e:
-            conn.send({"error": str(e)})
+            try:
+                conn.send({"error": traceback.format_exc()})
+            except (BrokenPipeError, EOFError, OSError):
+                break
