@@ -37,3 +37,5 @@ policy/CompactMoDE/runs/
 POTENTIAL_BUGS.md
 data/
 assets/
+policy/Mem0-Compact/lerobot_datasets/swap_blocks/
+policy/Mem0-Compact/runs/debug_compact/

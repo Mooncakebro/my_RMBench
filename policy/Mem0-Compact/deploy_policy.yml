@@ -1,0 +1,74 @@
+# Mem0-Compact eval configuration (consumed by script/eval_policy.py).
+# The whole file is passed to the agent; the `execution_module` section is used
+# to reconstruct the executor exactly as trained.
+policy_name: Mem0-Compact
+task_name: swap_blocks
+task_config: demo_clean
+ckpt_setting: compact_v1
+seed: 0
+instruction_type: unseen
+
+# Runtime/inference settings
+device: cuda:0
+camera_key: head_camera
+image_size: [224, 224]
+execution_ckpt: ./policy/Mem0-Compact/runs/compact/final.pt # TODO: point at trained ckpt
+state_stats_path: ./policy/Mem0-Compact/assets/swap_blocks/norm_stats.json
+
+action_horizon: 30
+threshold: 2 # when subtask end signal count reaches this value, we consider the subtask ended and move to the next one
+global_task: "There are three traies on the table, and two blocks are placed in two different traies. You may move only one block at a time, and each tray can hold at most one block. Swap the positions of the two blocks. Finally press the button."
+
+execution_module:
+  # Qwen VLM (loaded by CompactModeWrapper; flash-attn not required)
+  qwen_vl:
+    model_path: Qwen/Qwen3-VL-2B-Instruct
+    system_prompt: null
+  # COMPACT per-layer side memory
+  compact:
+    mem_dim: 128
+    num_mem_tokens: 16
+    num_heads: 8
+    num_obs_tokens: 4
+    freeze_base: false
+    bf16: true
+    gradient_checkpointing: false
+    lambda_obs: 0.01
+    lambda_nll: 0.01
+    lambda_mem: 0.001
+  # DiT Action Model
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 2048
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 16
+    state_dim: 16
+    action_horizon: 30
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 8
+    diffusion_model_cfg:    # DiT transformer parameters
+      cross_attention_dim: 2048 # VLM hidden dim
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2048
+      positional_embeddings: null
+  # Subtask End Classifier — DISABLED for M(1) tasks (idea.md §3.5)
+  use_classifier: false
+  classifier:
+    hidden_sizes: [4096, 2048, 512]
+    dropout: 0.1
+    pos_weight: 10.0
+    focal_gamma: 1.0
+    threshold: 0.5
+  # Loss Weights
+  loss_weights:
+    lambda_action: 1.0
+    lambda_classifier: 0.2
