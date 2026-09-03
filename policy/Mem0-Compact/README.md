@@ -63,9 +63,24 @@ python source/training/train_compact.py \
     --batch-size 1 --max-steps 10 --window-size 1 --opt-sgd
 
 # 3. server run (8×A800, batch 56/rank, 30K windows)
-python source/training/train_compact.py \
-    --config source/config/mem0_compact_train.yaml \
-    --task swap_blocks --device cuda --batch-size 56 --max-steps 30000
+bash source/training/train_ddp.sh
+# or explicitly:
+#   NPROC=8 TASK=swap_blocks BATCH_SIZE=56 MAX_STEPS=30000 \
+#     bash source/training/train_ddp.sh
+#
+# DDP notes:
+#   - torchrun launches one rank per GPU; episodes are sharded per rank
+#     (episode % world_size == rank), global batch = batch_size x NPROC
+#   - memory state (M, P, e) is per-rank; no cross-rank coupling
+#   - window loss is averaged across ranks for logging only
+#   - single-GPU multi-rank debugging auto-falls back to gloo+cpu
+#     (NCCL refuses two ranks on one physical device)
+#   - DDP smoke test (tiny model, no VLM):
+#       torchrun --nproc_per_node=2 debug/ddp_plumbing_test.py
+#   - real-model DDP smoke (8GB dev GPU):
+#       torchrun --nproc_per_node=1 source/training/train_compact.py \
+#         --task swap_blocks --freeze-base 1 --grad-ckpt 1 \
+#         --batch-size 1 --window-size 1 --opt-sgd --max-steps 4
 ```
 
 Note: `LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` is required in the

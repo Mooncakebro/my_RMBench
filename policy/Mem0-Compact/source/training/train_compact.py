@@ -1,9 +1,12 @@
 """
-Mem0-Compact TBPTT training loop (single process; DDP-ready structure).
+Mem0-Compact TBPTT training loop (single-process by default; DDP auto-enabled
+under torchrun).
 
 Per idea.md §3:
   - frames iterate sequentially within episodes via RandomEpisodeIterableDataset
-  - memory (M, P, e per layer) + prev_action are threaded across batches
+    (episodes sharded per rank: episode % world_size == rank)
+  - memory (M, P, e per layer) + prev_action are threaded across batches and
+    are per-sample / rank-local — no cross-rank coupling
   - loss accumulates over a K-frame window; ONE backward per window
   - memory is detached at window boundaries (gradients never cross windows)
   - when a batch slot's episode_id changes, that slot's memory is re-initialized
@@ -17,10 +20,24 @@ Loss per frame:
     L = 1.0 * L_flow + 0.2 * L_cls (M(n) only)
         + 0.01 * L_obs + 0.01 * L_nll + 0.001 * L_mem
 
-Example:
+DDP notes:
+  - forward must go through `model(batch, memory)` (DDP.forward) — calling
+    inner methods directly would skip gradient sync.
+  - find_unused_parameters=True (dynamic graph edges: e_prev=None at window
+    starts; classifier absent for M(1)).
+  - per-rank batch_size is the config value; global batch = batch * world_size.
+  - checkpointing/logging are rank-0-only; window loss is all-reduced for logs.
+
+Example (single process):
     python source/training/train_compact.py \
         --config source/config/mem0_compact_train.yaml \
         --task swap_blocks --freeze-base 1 --max-steps 20
+
+Example (DDP, 8 GPUs):
+    torchrun --nproc_per_node=8 source/training/train_compact.py \
+        --config source/config/mem0_compact_train.yaml \
+        --task swap_blocks --batch-size 56 --max-steps 30000
+    (see source/training/train_ddp.sh)
 """
 from __future__ import annotations
 
@@ -33,6 +50,8 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -47,6 +66,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from source.dataloader.dataset_min_max import LeRobot_Dataset
 from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
 from source.models.execution_module.mem0_compact_executor import Mem0CompactExecutor
+from source.training.ddp_utils import (all_reduce_avg, destroy_distributed,
+                                       get_ddp_device, is_rank0, rank0_print,
+                                       setup_distributed)
 
 
 def collate_batch(samples: list) -> dict:
@@ -133,7 +155,7 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         base_dataset=base_dataset,
         rank=rank, world_size=world_size,
         shuffle=bool(cfg.get("dataloader", {}).get("shuffle_episodes", True)),
-        seed=int(cfg.get("dataloader", {}).get("seed", cfg.get("seed", 42))),
+        seed=int(cfg.get("dataloader", {}).get("seed", cfg.get("seed", 42))) + rank,
         infinite=bool(cfg.get("dataloader", {}).get("infinite", True)),
     )
     loader = DataLoader(iterable, batch_size=batch_size,
@@ -153,7 +175,13 @@ def save_checkpoint(path: Path, model, optimizer, step, cfg) -> None:
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
+
+    # ── Distributed setup (torchrun-compatible; falls back to single process) ──
+    rank, world_size, local_rank, ddp_enabled = setup_distributed()
+    if ddp_enabled:
+        device = get_ddp_device(local_rank, world_size)
+    else:
+        device = torch.device(args.device)
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
@@ -187,27 +215,37 @@ def main():
     output_dir = Path(args.output_dir or trainer_cfg.get(
         "checkpoint_dir", str(PROJECT_ROOT / "runs" / "compact")))
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "config.yaml").open("w") as f:
-        f.write(OmegaConf.to_yaml(cfg))
-    cprint(f"[train] output_dir={output_dir}", "green")
+    if is_rank0():
+        with (output_dir / "config.yaml").open("w") as f:
+            f.write(OmegaConf.to_yaml(cfg))
+    rank0_print(f"[train] output_dir={output_dir} ddp={ddp_enabled} "
+                f"rank={rank}/{world_size}")
 
     seed = int(cfg.get("seed", 42))
-    torch.manual_seed(seed)
+    torch.manual_seed(seed + rank)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed + rank)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
     # ── Model ──
-    cprint("[train] building executor (this loads Qwen3-VL-2B)...", "cyan")
+    rank0_print("[train] building executor (this loads Qwen3-VL-2B)...")
     model = Mem0CompactExecutor(cfg, device=device).to(device)
-    counts = model.trainable_param_counts()
-    cprint(f"[train] param counts: {counts}", "cyan")
+    if ddp_enabled:
+        model = DDP(model,
+                    device_ids=[device.index] if device.type == "cuda" else None,
+                    find_unused_parameters=True)
+    raw_model = model.module if ddp_enabled else model
+    if is_rank0():
+        counts = raw_model.trainable_param_counts()
+        rank0_print(f"[train] param counts: {counts}")
 
-    groups = model.get_optim_groups(base_lr, head_lr, memory_lr, weight_decay)
+    groups = raw_model.get_optim_groups(base_lr, head_lr, memory_lr, weight_decay)
     if args.opt_sgd:
-        cprint("[train] using plain SGD (small-GPU debug)", "yellow")
-        optimizer = torch.optim.SGD(groups)
+        rank0_print("[train] using plain SGD (small-GPU debug)")
+        # foreach=False: multi-tensor foreach allocates temporary full-grad
+        # buffers that OOM on the 8GB dev GPU; server can use the default.
+        optimizer = torch.optim.SGD(groups, foreach=False)
     else:
         optimizer = AdamW(groups)
     scheduler = LambdaLR(optimizer, make_lr_lambda(max_steps, warmup_ratio))
@@ -219,25 +257,25 @@ def main():
                               weights_only=False, mmap=True)
         except TypeError:
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"], strict=False)
+        raw_model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
         del ckpt
-        cprint(f"[train] resumed from {args.resume} at step {start_step}", "green")
+        rank0_print(f"[train] resumed from {args.resume} at step {start_step}")
 
-    # ── Data ──
-    loader = build_dataloader(cfg, args.task, batch_size=batch_size,
-                              num_workers=args.num_workers)
+    # ── Data (episodes sharded per rank; global batch = batch * world_size) ──
+    loader = build_dataloader(cfg, args.task, rank=rank, world_size=world_size,
+                              batch_size=batch_size, num_workers=args.num_workers)
     data_iter = iter(loader)
 
-    # ── TBPTT state ──
+    # ── TBPTT state (per-rank, no cross-rank coupling) ──
     model.train()
-    memory = model.init_memory(batch_size, device)
+    memory = raw_model.init_memory(batch_size, device)
     prev_episode = torch.full((batch_size,), -1, dtype=torch.long, device=device)
     total_iters = max_steps * window_size
 
-    cprint(f"[train] TBPTT window={window_size}, steps={max_steps}, "
-           f"batch={batch_size}, iters={total_iters}", "cyan")
+    rank0_print(f"[train] TBPTT window={window_size}, steps={max_steps}, "
+                f"batch={batch_size}x{world_size}, iters={total_iters}")
 
     step_times = []
     for step in range(start_step, max_steps):
@@ -256,7 +294,7 @@ def main():
             # Per-slot episode reset: memory + prev_action + episode tracker.
             reset_mask = [(prev_episode[i] >= 0 and prev_episode[i] != ep_ids[i])
                           for i in range(batch_size)]
-            memory = model.reset_memory_rows(memory, reset_mask, device)
+            memory = raw_model.reset_memory_rows(memory, reset_mask, device)
             prev_action = batch["state"].squeeze(1).to(device).clone().detach()
             for i in range(batch_size):
                 if reset_mask[i]:
@@ -264,7 +302,10 @@ def main():
             prev_episode = ep_ids.clone()
             batch["prev_action"] = prev_action
 
-            loss_dict, memory = model.forward_step(batch, memory)
+            # Forward MUST go through the (DDP-wrapped) model — DDP.forward
+            # registers the gradient-sync hooks; bypassing it would silently
+            # skip gradient synchronization across ranks.
+            loss_dict, memory = model(batch, memory)
             window_loss = window_loss + loss_dict["total"] / window_size
             if k == window_size - 1:
                 log_parts = {key: float(value.detach())
@@ -272,9 +313,9 @@ def main():
                              if isinstance(value, torch.Tensor)}
 
         if not torch.isfinite(window_loss):
-            cprint(f"[train] step {step+1}: non-finite window loss, skipping", "red")
+            rank0_print(f"[train] step {step+1}: non-finite window loss, skipping")
             optimizer.zero_grad(set_to_none=True)
-            memory = model.detach_memory(memory)
+            memory = raw_model.detach_memory(memory)
             continue
 
         optimizer.zero_grad(set_to_none=True)
@@ -286,21 +327,28 @@ def main():
         scheduler.step()
 
         # TBPTT: gradients never cross windows.
-        memory = model.detach_memory(memory)
+        memory = raw_model.detach_memory(memory)
+
+        # Sync window loss across ranks for logging (only; not reused in graph).
+        all_reduce_avg(window_loss)
 
         step_times.append(time.time() - t0)
         if (step + 1) % log_interval == 0 or step == start_step:
             parts = " ".join(f"{k} {v:.4f}" for k, v in log_parts.items())
             avg_t = sum(step_times[-log_interval:]) / len(step_times[-log_interval:])
-            cprint(f"[train] step {step+1}/{max_steps} loss {window_loss.item():.4f} "
-                   f"({parts}) lr {scheduler.get_last_lr()[0]:.2e} ({avg_t:.2f}s/window)",
-                   "cyan")
-        if save_every > 0 and (step + 1) % save_every == 0:
+            rank0_print(f"[train] step {step+1}/{max_steps} "
+                        f"loss {window_loss.item():.4f} "
+                        f"({parts}) lr {scheduler.get_last_lr()[0]:.2e} "
+                        f"({avg_t:.2f}s/window)")
+        if save_every > 0 and (step + 1) % save_every == 0 and is_rank0():
             save_checkpoint(output_dir / f"ckpt_{step+1:07d}.pt",
-                            model, optimizer, step + 1, cfg)
+                            raw_model, optimizer, step + 1, cfg)
 
-    save_checkpoint(output_dir / "ckpt_final.pt", model, optimizer, max_steps, cfg)
-    cprint(f"[train] done. {max_steps} windows. Saved to {output_dir}", "green")
+    if is_rank0():
+        save_checkpoint(output_dir / "ckpt_final.pt", raw_model, optimizer,
+                        max_steps, cfg)
+        rank0_print(f"[train] done. {max_steps} windows. Saved to {output_dir}")
+    destroy_distributed()
 
 
 if __name__ == "__main__":
