@@ -214,10 +214,15 @@ def main():
 
     start_step = 0
     if args.resume and args.resume.exists():
-        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(args.resume, map_location="cpu",
+                              weights_only=False, mmap=True)
+        except TypeError:
+            ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
+        del ckpt
         cprint(f"[train] resumed from {args.resume} at step {start_step}", "green")
 
     # ── Data ──

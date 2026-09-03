@@ -26,23 +26,37 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import deploy_policy as deploy
-from source.dataloader.dataset_min_max import LeRobot_Dataset
 from source.agent.mem0_compact_agent import Mem0CompactAgent
 
+try:
+    from source.dataloader.dataset_min_max import LeRobot_Dataset
+    _HAS_LEROBOT = True
+except Exception:
+    LeRobot_Dataset = None
+    _HAS_LEROBOT = False
 
-def fake_observation(dataset: LeRobot_Dataset, idx: int) -> dict:
-    """Build an RMBench-style observation from a dataset frame."""
-    sample = dataset[idx]
-    img = sample["image"][0]  # PIL 224x224 (already resized by dataset)
-    # Reconstruct raw env-layout 14-dim vector from the 16-dim model-layout
-    # state: model layout [LA(6), pad, RA(6), pad, LG, RG] -> env layout
-    # [LA(6), LG, RA(6), RG].
-    state16 = np.asarray(sample["state"]).reshape(16).astype(np.float64)
-    env14 = np.concatenate([
-        state16[0:6], state16[7:8], state16[8:14], state16[15:16]])
+
+def fake_observation(dataset: Optional[object], idx: int) -> dict:
+    """Build an RMBench-style observation from a dataset frame, or
+    synthetically when lerobot is not installed in this env."""
+    if dataset is not None:
+        sample = dataset[idx]
+        img = sample["image"][0]  # PIL 224x224 (already resized by dataset)
+        # Reconstruct raw env-layout 14-dim vector from the 16-dim model-layout
+        # state: model layout [LA(6), pad, RA(6), pad, LG, RG] -> env layout
+        # [LA(6), LG, RA(6), RG].
+        state16 = np.asarray(sample["state"]).reshape(16).astype(np.float64)
+        env14 = np.concatenate([
+            state16[0:6], state16[7:8], state16[8:14], state16[15:16]])
+        return {
+            "observation": {"head_camera": {"rgb": np.asarray(img)}},
+            "joint_action": {"vector": env14.astype(np.float32)},
+        }
+    rgb = np.random.randint(0, 255, (240, 320, 3), dtype=np.uint8)
     return {
-        "observation": {"head_camera": {"rgb": np.asarray(img)}},
-        "joint_action": {"vector": env14.astype(np.float32)},
+        "observation": {"head_camera": {"rgb": rgb}},
+        "joint_action": {"vector": np.random.uniform(-0.2, 0.2, (14,))
+                                   .astype(np.float32)},
     }
 
 
@@ -72,14 +86,19 @@ def main():
     agent.reset()
     agent.instruction = cfg.global_task
 
-    # Real dataset frames for realistic observations.
-    dataset = LeRobot_Dataset(
-        repo_id=args.task,
-        root=str(PROJECT_ROOT / "lerobot_datasets" / args.task),
-        features_to_load=["observation.image.head_camera", "observation.state",
-                          "action", "subtask", "subtask_end", "episode_id"],
-        image_scale=(224, 224),
-    )
+    # Real dataset frames for realistic observations (optional — needs lerobot).
+    dataset = None
+    if _HAS_LEROBOT:
+        dataset = LeRobot_Dataset(
+            repo_id=args.task,
+            root=str(PROJECT_ROOT / "lerobot_datasets" / args.task),
+            features_to_load=["observation.image.head_camera",
+                              "observation.state", "action", "subtask",
+                              "subtask_end", "episode_id"],
+            image_scale=(224, 224),
+        )
+    else:
+        print("[deploy-test] lerobot not installed here; using synthetic obs")
 
     for call in range(args.n_calls):
         obs = fake_observation(dataset, call)
@@ -112,6 +131,14 @@ def main():
     agent.reset()
     assert agent.memory is None and agent.iter == 0
     print("\n[deploy-test] agent-level checks passed ✔")
+
+    # Free the agent before building a second one via get_model (2B model x2
+    # exceeds this dev machine's 15GB RAM).
+    del agent
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ── Full eval_policy contract: get_model / eval / reset_model ──
     print("\n[deploy-test] exercising deploy_policy.get_model/eval/reset_model "

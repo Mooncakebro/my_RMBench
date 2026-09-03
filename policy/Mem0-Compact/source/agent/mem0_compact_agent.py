@@ -77,9 +77,16 @@ class Mem0CompactAgent:
     def _load_ckpt(self, ckpt_path: str):
         if not ckpt_path or not Path(ckpt_path).is_file():
             raise FileNotFoundError(f"execution ckpt not found: {ckpt_path}")
-        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # mmap=True: don't materialize the full state dict in RAM — the 2B
+        # model + full ckpt together exceed small dev machines (15GB RAM).
+        try:
+            payload = torch.load(ckpt_path, map_location="cpu",
+                                 weights_only=False, mmap=True)
+        except TypeError:  # older torch without mmap support
+            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state_dict = payload.get("model_state_dict", payload.get("model", payload))
         missing, unexpected = self.executor.load_state_dict(state_dict, strict=False)
+        del payload, state_dict
         cprint(f"[Mem0-Compact] loaded ckpt {ckpt_path} "
                f"(missing={len(missing)}, unexpected={len(unexpected)})", "green")
 
