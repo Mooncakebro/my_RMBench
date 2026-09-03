@@ -8,7 +8,10 @@ Adapted from Mem-0's source/agent/memorymatters_agent.py with:
     dataset action[t] = state[t+1] convention); zeros on the first observation
     of an episode.
   - M(1): fixed global instruction, no planner, classifier unused.
-    (M(n) planner wiring will be added when M(n) tasks are targeted.)
+  - M(n): planner (Qwen3-VL-8B via vLLM) provides subtask instructions;
+    SubtaskEndClassifier fires sub_end signals; threshold crossing saves a
+    keyframe, asks the planner for the next subtask, and continues. COMPACT
+    memory is NOT reset at subtask boundaries (idea.md decision 3).
 """
 from __future__ import annotations
 
@@ -69,6 +72,27 @@ class Mem0CompactAgent:
         self.end_signal_count = 0
         self.action_count = 0
         self.instruction = self.config.get("global_task", "")
+
+        # Planner (M(n) only; served remotely via vLLM — copied from Mem-0).
+        self.high_model = None
+        if self.task_type == "Mn":
+            from source.models.planning_module.memorymatters_planner import (
+                MemoryMattersPlanner)
+            planner_cfg_path = str(self.config.get(
+                "planning_module_config_path",
+                str(PROJECT_ROOT / "source/config/planning_module_inference.yaml")))
+            # The yml value is relative to the RMBench repo root (where
+            # eval_policy.py runs); fall back to CWD, then the repo root.
+            if not Path(planner_cfg_path).is_file():
+                repo_root = PROJECT_ROOT.parent.parent  # RMBench/
+                alt = repo_root / planner_cfg_path.lstrip("./")
+                if Path(alt).is_file():
+                    planner_cfg_path = str(alt)
+            self.high_model = MemoryMattersPlanner(
+                config=OmegaConf.load(planner_cfg_path),
+                global_task=self.config.get("global_task", ""),
+                vllm_url=self.config.get("vllm_url", "http://localhost:8000"),
+            )
 
         # tmp visual folder (kept for parity with Mem-0's eval artifacts)
         shutil.rmtree("./_tmp_visual/", ignore_errors=True)
@@ -132,7 +156,9 @@ class Mem0CompactAgent:
 
         obs_payload: {"image": PIL, "state": np.ndarray (1,16) normalized,
                       "instruction": str}
-        Returns sub_end_flag (always 0 for M1; classifier unused).
+        Returns sub_end_flag: 0 for M(1); for M(n), 1 when the classifier's
+        subtask-end probability crosses its threshold (idea.md: memory is
+        NOT reset here — only the eval loop reacts).
         """
         images = [[obs_payload["image"]]]
         instructions = [obs_payload.get("instruction", self.instruction)]
@@ -157,7 +183,14 @@ class Mem0CompactAgent:
         self._last_summary = summary
         self._last_state = state_out
         self.action_count += 1
-        return 0  # M1: no subtask-end signals
+
+        # M(n): subtask-end signal from the classifier.
+        if self.task_type == "Mn":
+            prob = self.executor.predict_subtask_end(summary)
+            sub_end = 1 if prob >= self.executor.classifier_threshold else 0
+            self.end_signal_count += sub_end
+            return sub_end
+        return 0
 
     @torch.inference_mode()
     def get_action(self) -> Optional[dict]:
@@ -171,9 +204,32 @@ class Mem0CompactAgent:
             return None
         return {"normalized_actions": pred_actions.detach().cpu().numpy()}
 
+    # ── M(n) planner interaction (copied from Mem-0 agent) ──
+
+    def get_instruction(self):
+        qwen_inputs = self.high_model.prepare_qwen_input()
+        answer = self.high_model.generate_anwser(qwen_inputs)
+        subtask = answer.split("next_subtask: ")[-1].split(".")[0]
+        self.instruction = subtask
+        cprint(f"[Mem0-Compact] high-level instruction: {self.instruction}", "cyan")
+
+    def init_high_with_image(self):
+        self.high_model.update_initial_observation("./_tmp_visual/init.png")
+        self.get_instruction()
+        self._set_video_ffmpeg()
+
+    def update_high_observation(self):
+        self.high_model.update_image_or_video_input(
+            [f"./_tmp_visual/image_{self.stage}.png"], [self.instruction])
+        self.get_instruction()
+        self.stage += 1
+        self._set_video_ffmpeg()
+
     # ── episode reset (called by reset_model at episode start) ──
 
     def reset(self):
+        if self.is_init == 1:
+            self._del_video_ffmpeg()
         self.memory = None
         self.prev_action = None
         self.iter = 0
@@ -184,6 +240,10 @@ class Mem0CompactAgent:
         self._last_summary = None
         self._last_state = None
         self.is_init = 0
+        if self.high_model is not None:
+            self.high_model.key_information = []
+            self.high_model.finished_subtasks = []
+            self.high_model.initial_observation = None
 
     # ── video (parity with Mem-0 eval artifacts) ──
 

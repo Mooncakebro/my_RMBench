@@ -19,6 +19,10 @@ action_horizon: 30
 threshold: 2 # when subtask end signal count reaches this value, we consider the subtask ended and move to the next one
 global_task: "There are three traies on the table, and two blocks are placed in two different traies. You may move only one block at a time, and each tray can hold at most one block. Swap the positions of the two blocks. Finally press the button."
 
+# ── M(n) only: remote planning module (Qwen3-VL-8B via vLLM) ──
+planning_module_config_path: ./policy/Mem0-Compact/source/config/planning_module_inference.yaml
+vllm_url: http://localhost:8000
+
 execution_module:
   # Qwen VLM (loaded by CompactModeWrapper; flash-attn not required)
   qwen_vl:

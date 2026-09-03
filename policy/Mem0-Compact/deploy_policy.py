@@ -31,7 +31,7 @@ if str(THIS_DIR) not in sys.path:
 from scripts.tools_for_deploy.image_utils import to_pil
 from scripts.tools_for_deploy.layout_utils import env_to_model_layout, model_to_env_layout
 from scripts.tools_for_deploy.normlization import denormalize_arms, load_stats, normalize_arms
-from source.agent.mem0_compact_agent import Mem0CompactAgent
+from source.agent.mem0_compact_agent import M1_TASKS, Mem0CompactAgent
 
 # Normalization method (minmax — matches dataset_min_max.py training norm)
 NORM_WAY = "minmax"
@@ -137,6 +137,13 @@ def get_model(usr_args: dict) -> Mem0CompactAgent:
     _load_stats(stats_path)
     cfg = OmegaConf.create(usr_args)
 
+    # M(n) tasks need the SubtaskEndClassifier (flat CLI overrides cannot
+    # reach nested config keys, so force it here based on the task name).
+    task_name = str(usr_args.get("task_name", ""))
+    if task_name and task_name not in M1_TASKS:
+        cfg.execution_module.use_classifier = True
+        cprint(f"[deploy] M(n) task '{task_name}': classifier enabled", "yellow")
+
     cprint(f"[deploy] device: {device}; camera: {_RUNTIME_SETTINGS['camera_key']}", "cyan")
     cprint(f"[deploy] ckpt: {ckpt_path}", "cyan")
     agent = Mem0CompactAgent(cfg, ckpt_path=ckpt_path, device=device)
@@ -144,13 +151,19 @@ def get_model(usr_args: dict) -> Mem0CompactAgent:
 
 
 def eval(TASK_ENV, model: Mem0CompactAgent, observation: dict):
-    """Execute one chunk of actions (M1 path)."""
+    """Execute one chunk of actions (M1 + Mn paths)."""
     if model.is_init == 0:
         model.is_init = 1
         image = TASK_ENV.now_obs["observation"]["head_camera"]["rgb"]
         Image.fromarray(image).save("./_tmp_visual/init.png")
-        model.instruction = model.config.get("global_task", "")
-        model._set_video_ffmpeg()
+
+        # ── Mn: planner provides the first subtask instruction ──
+        if model.task_type == "Mn":
+            model.init_high_with_image()
+        # ── M1: fixed global instruction ──
+        if model.task_type == "M1":
+            model.instruction = model.config.get("global_task", "")
+            model._set_video_ffmpeg()
 
     instruction = model.instruction
     observation["instruction"] = instruction
@@ -179,10 +192,33 @@ def eval(TASK_ENV, model: Mem0CompactAgent, observation: dict):
         observation = TASK_ENV.get_obs()
         observation["instruction"] = instruction
         encoded_obs = encode_obs(observation)
-        model.update_obs(encoded_obs)
+        sub_end_flag = model.update_obs(encoded_obs)
+
+        # ── Mn: subtask-end gating (COMPACT memory NOT reset — idea.md §3) ──
+        if model.task_type == "Mn":
+            if sub_end_flag == 1:
+                cprint(f"[deploy] subtask end signal += 1 on [{model.iter}]", "yellow")
+            if model.end_signal_count >= model.threshold:
+                image = TASK_ENV.now_obs["observation"]["head_camera"]["rgb"]
+                Image.fromarray(image).save(f"./_tmp_visual/image_{model.stage}.png")
+                break
 
     # Advance iteration by number of executed steps
     model.iter += steps_to_run
+
+    # ── Mn: subtask transition → planner for the next instruction ──
+    if model.task_type == "Mn" and model.end_signal_count >= model.threshold:
+        if hasattr(model, "ffmpeg") and model.ffmpeg is not None:
+            model.ffmpeg.stdin.write(
+                TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+            model._del_video_ffmpeg()
+        cprint(f"[deploy] subtask end detected; moving to stage {model.stage + 1}, "
+               f"action_count {model.action_count}", "green")
+        model.update_high_observation()  # planner → new instruction
+        model.end_signal_count = 0
+        model.action_count = 0
+        # NOTE: executor memory is deliberately NOT reset here (idea.md
+        # decision 3: memory persists across subtask boundaries).
 
 
 def reset_model(model: Mem0CompactAgent):

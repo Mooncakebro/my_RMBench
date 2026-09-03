@@ -67,24 +67,50 @@ def main():
     p.add_argument("--stats", type=str,
                    default="assets/swap_blocks/norm_stats.json")
     p.add_argument("--task", type=str, default="swap_blocks")
+    p.add_argument("--task-name", type=str, default="swap_blocks",
+                   help="RMBench task name for the agent's M1/Mn detection "
+                        "(cover_blocks exercises the Mn path)")
+    p.add_argument("--mn", action="store_true",
+                   help="shortcut for --task-name cover_blocks --ckpt runs/mn "
+                        "(Mn-path check; planner built offline, never called)")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--n-calls", type=int, default=2)
     args = p.parse_args()
 
+    if args.mn:
+        args.task_name = "cover_blocks"
+
     cfg = OmegaConf.load(PROJECT_ROOT / "deploy_policy.yml")
     cfg.device = args.device
     cfg.execution_ckpt = str(PROJECT_ROOT / args.ckpt)
     cfg.state_stats_path = str(PROJECT_ROOT / args.stats)
+    cfg.task_name = args.task_name
+    is_mn = args.task_name not in ("swap_blocks", "swap_T",
+                                   "observe_and_pickup", "put_back_block",
+                                   "rearrange_blocks")
 
     deploy._load_stats(cfg.state_stats_path)
     deploy._RUNTIME_SETTINGS["device"] = torch.device(args.device)
 
     print(f"[deploy-test] device={args.device}, building agent...")
+    if is_mn:
+        # M(n) eval: classifier forced on (mirrors deploy_policy.get_model).
+        cfg.execution_module.use_classifier = True
+        cfg.global_task = ("On the table, red, green, and blue blocks are "
+                           "arranged randomly along with three lids.")
     agent = Mem0CompactAgent(cfg, ckpt_path=cfg.execution_ckpt,
                              device=torch.device(args.device))
     agent.reset()
     agent.instruction = cfg.global_task
+
+    if is_mn:
+        assert agent.task_type == "Mn", "task_type detection failed"
+        assert agent.executor.classifier is not None, \
+            "Mn classifier not built"
+        assert agent.high_model is not None, "Mn planner not constructed"
+        print("[deploy-test] Mn: classifier + planner built OK (planner "
+              "constructed offline; no vLLM calls in this test)")
 
     # Real dataset frames for realistic observations (optional — needs lerobot).
     dataset = None
@@ -107,7 +133,12 @@ def main():
         print(f"[deploy-test] call {call}: encoded state shape "
               f"{encoded['state'].shape}, image {encoded['image'].size}")
         sub_end = agent.update_obs(encoded)
-        assert sub_end == 0, "M1 must not emit subtask-end signals"
+        if is_mn:
+            assert sub_end in (0, 1), "Mn sub_end flag must be 0 or 1"
+            print(f"[deploy-test] call {call}: sub_end_flag={sub_end} "
+                  f"(classifier prob path OK)")
+        else:
+            assert sub_end == 0, "M1 must not emit subtask-end signals"
         result = agent.get_action()
         assert result is not None, "get_action returned None"
         chunk = result["normalized_actions"]

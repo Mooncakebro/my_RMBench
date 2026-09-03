@@ -37,8 +37,8 @@ def make_synthetic_batch(B: int = 2, T: int = 30) -> dict:
         "action": torch.randn(B, T, 16),
         "state": torch.randn(B, 1, 16).clamp(-1, 1),
         "prev_action": torch.zeros(B, 16),
-        "episode_id": torch.tensor([0, 1]),
-        "subtask_end": torch.tensor([0, 0]),
+        "episode_id": torch.arange(B, dtype=torch.long),
+        "subtask_end": torch.zeros(B, dtype=torch.long),
     }
 
 

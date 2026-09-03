@@ -1,6 +1,7 @@
 import os
 import h5py
 import cv2
+import argparse
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -11,6 +12,11 @@ workspace = os.path.dirname(os.path.abspath(__file__))
 RMBench_workspace = os.path.join(workspace, "..", "..", "..", "..")
 Mem0_workspace = os.path.join(workspace, "..", "..")
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--task", type=str, default="cover_blocks")
+parser.add_argument("--episodes", type=int, default=50)
+args = parser.parse_args()
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -20,16 +26,10 @@ except ImportError:
             print(f"{desc}: Processing...")
         return iterable
 
-TASK_NAMES = [
-    "battery_try",
-    "blocks_ranking_try",
-    "cover_blocks",
-    "press_button",
-    "place_block_mat",
-]
+TASK_NAMES = [args.task]
 
 # Define number of episodes to process
-episode_num = 50
+episode_num = args.episodes
 
 TASK_INSTRUCTIONS = {
     "battery_try": "There are two batteries and a battery slot on the table. Combining the two batteries in different orientations causes the dashboard needle to rotate.",
@@ -39,7 +39,7 @@ TASK_INSTRUCTIONS = {
     "place_block_mat": "Pick up the blocks from the blue mat and place them on the green mat, then put them back on the original mat, starting from left to right.",
 }
 
-lerobot_dataset_name = "rmbench_data_cover_blocks"
+lerobot_dataset_name = args.task
 
 features = {
     "observation.state": {
@@ -215,10 +215,11 @@ for dataset_name in task_pbar:
                         "global_task": global_task_text,  # Fill in global task instruction
                         "subtask_end": np.array([subtask_end], dtype=bool),  # shape: (1,)
                         "episode_id": np.array([episode_idx], dtype=np.int32),  # shape: (1,)
+                        "task": dataset_name,  # lerobot 0.4.4: task is a required frame field
                     }
                     
-                    # Add current frame using add_frame, with task as keyword argument
-                    dataset.add_frame(frame_data, task=dataset_name)
+                    # Add current frame using add_frame
+                    dataset.add_frame(frame_data)
             
             # Save when episode ends
             dataset.save_episode()
@@ -232,6 +233,10 @@ for dataset_name in task_pbar:
             episode_iter.set_postfix_str(f"✗ Error: {str(e)[:30]}")
             import traceback
             traceback.print_exc()
+
+    # lerobot 0.4.4: must finalize to write parquet footers + episodes metadata
+    dataset.finalize()
+    print(f"  ✓ {dataset_name} finalized")
 
 print(f"\n{'='*60}")
 print(f"All tasks processed!")

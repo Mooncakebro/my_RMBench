@@ -1,0 +1,112 @@
+# Mem0-Compact execution-module training config (swap_blocks M1 first target).
+# Based on Mem-0's source/config/execution_module_train.yaml with the MemoryBank
+# removed and the COMPACT side-memory section added. See idea.md for the design
+# contract.
+
+seed: 42
+wandb_entity:
+wandb_project: Mem0-Compact
+is_debug: false
+
+execution_module:
+  # Qwen VLM (loaded by CompactModeWrapper — bf16, sdpa attention; flash-attn
+  # is NOT required and excluded per CompactMoDE env constraints)
+  qwen_vl:
+    model_path: Qwen/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
+    system_prompt: null
+
+  # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
+  compact:
+    mem_dim: 128
+    num_mem_tokens: 16
+    num_heads: 8
+    num_obs_tokens: 4
+    freeze_base: false          # opt-in via --freeze-base 1 / FREEZE_BASE=1
+    bf16: true
+    gradient_checkpointing: false
+    lambda_obs: 0.01
+    lambda_nll: 0.01
+    lambda_mem: 0.001
+
+  # Flow-matching DiT action head (copied from Mem-0, unchanged)
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 2048
+    add_pos_embed: True
+    max_seq_len: 1024
+    action_dim: 16
+    state_dim: 16
+    action_horizon: 30
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 8
+    diffusion_model_cfg:    # DiT transformer parameters
+      cross_attention_dim: 2048 # VLM hidden dim
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 2048
+      positional_embeddings: null
+
+  # Subtask End Classifier — input 2x2048=4096 (idea.md §2.3). DISABLED for
+  # M(1) tasks (idea.md §3.5); enable for M(n).
+  use_classifier: true
+  classifier:
+    hidden_sizes: [4096, 2048, 512]
+    dropout: 0.1
+    pos_weight: 10.0
+    focal_gamma: 1.0
+    threshold: 0.5
+
+  # Loss weights (idea.md §3): flow 1.0, cls 0.2 (Mn), aux in `compact` above
+  loss_weights:
+    lambda_action: 1.0
+    lambda_classifier: 0.2
+
+# TBPTT training loop (idea.md §3)
+tbptt:
+  window_size: 8          # K — frames per backward window
+  detach_at_boundary: true
+
+dataloader:
+  num_workers: 0          # >0 works, but memory threading assumes batch-slot continuity
+  shuffle_episodes: true
+  seed: 42
+  infinite: true
+
+trainer:
+  wandb_run_name: null
+  resume: null
+  batch_size: 4           # local debug; server: 56 per A800
+  max_steps: 100          # windows (local debug); server: 30000
+  log_interval: 5
+  enable_wandb: false
+  checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
+  save_every_steps: 50
+  save_final: true
+  scheduler: cosine
+  warmup_ratio: 0.05
+  grad_clip_norm: 2.5
+  weight_decay: 0.005
+  norm_stats_path: null   # e.g. assets/swap_blocks/norm_stats.json
+  learning_rate:
+    qwen_model: 1.0e-5
+    action_model: 1.0e-4
+    classifier: 1.0e-4
+    memory: 5.0e-6        # side memory + action_embed + prev_action_mlp
+
+vla_dataset:
+  RMBench:
+    repo_id: null         # or lerobot_datasets/<task> (auto when --task given)
+    features_to_load:
+      - observation.state
+      - action
+      - subtask
+      - subtask_end
+      - episode_id
+      - observation.image.head_camera
