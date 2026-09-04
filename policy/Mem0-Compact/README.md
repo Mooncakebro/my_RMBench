@@ -45,8 +45,10 @@ policy/Mem0-Compact/
 │   ├── training/train_compact.py    # TBPTT training loop
 │   └── config/mem0_compact_train.yaml
 ├── scripts/
-│   ├── hdf5_to_lerobot/M1_dataset_to_lerobot.py   # swap_blocks → lerobot_datasets/
-│   └── gen_norm_stats.py             # assets/<task>/norm_stats.json
+│   ├── hdf5_to_lerobot/M1_dataset_to_lerobot.py   # M(1) raw HDF5 → lerobot_datasets/
+│   ├── hdf5_to_lerobot/Mn_dataset_to_lerobot.py   # M(n) raw HDF5 + subtasks → lerobot_datasets/
+│   ├── convert_all.sh             # batch: all 12 tasks (5 M1 + 7 Mn)
+│   └── gen_norm_stats.py          # assets/<task>/norm_stats.json
 └── debug/                            # smoke_forward / tbptt_check / test_deploy
 ```
 
@@ -55,12 +57,12 @@ policy/Mem0-Compact/
 ```bash
 cd policy/Mem0-Compact
 
-# 1. data prep (lerobot v3.0 format)
-python scripts/hdf5_to_lerobot/M1_dataset_to_lerobot.py --task swap_blocks --episodes 50
-python scripts/gen_norm_stats.py --task swap_blocks
-# M(n) tasks (with subtask annotations):
+# 1. data prep (lerobot v3.0 format) — all 12 tasks in one go:
+bash scripts/convert_all.sh
+# or single tasks:
+#   python scripts/hdf5_to_lerobot/M1_dataset_to_lerobot.py --task swap_blocks --episodes 50
 #   python scripts/hdf5_to_lerobot/Mn_dataset_to_lerobot.py --task cover_blocks --episodes 50
-#   python scripts/gen_norm_stats.py --task cover_blocks
+#   python scripts/gen_norm_stats.py --task swap_blocks
 
 # 2. local debug run (8GB GPU escape hatches: window 1 + SGD)
 python source/training/train_compact.py \

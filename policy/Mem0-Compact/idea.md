@@ -129,7 +129,10 @@ language-conditioning data and the planner's existence differ.
   whole episode one fixed instruction (the global task text); no subtask
   segmentation; no planner at train or eval; executor runs standalone.
 - **M(n) tasks** (`battery_try`, `blocks_ranking_try`, `cover_blocks`,
-  `press_button`, `place_block_mat`): data prep (`Mn_dataset_to_lerobot.py`)
+  `press_button`, `place_block_mat`, `classify_blocks`, `storage_blocks`):
+  (owner-approved addition 2026-09-04: `classify_blocks` and `storage_blocks`
+  were not in Mem-0's data-prep lists but are RMBench tasks with full subtask
+  annotations — converted as M(n).) data prep (`Mn_dataset_to_lerobot.py`)
   reads `data/<task>/demo_clean/language_annotation.json`, segments episodes
   into `[start_frame, end_frame, subtask_text]`, labels each frame with its
   current subtask text plus `subtask_end=True` within 8 frames of a boundary,
