@@ -17,12 +17,16 @@
 #   EPISODES        base episodes per task from demo_clean (default 50)
 #   EPISODES_200    extra episodes from demo_clean_200 (default 200)
 #   SKIP_200        1 to skip the demo_clean_200 append phase
+#   APPEND_ONLY     1 to skip the base demo_clean phase (datasets already exist)
 set -e
-cd "$(dirname "$0")/.."   # policy/Mem0-Compact/
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"   # scripts/
+cd "$SCRIPT_DIR/.."   # policy/Mem0-Compact/
+REPO_ROOT="$(cd ../.. && pwd)"                # RMBench/ (raw data lives here)
 
 EPISODES=${EPISODES:-50}
 EPISODES_200=${EPISODES_200:-200}
 SKIP_200=${SKIP_200:-0}
+APPEND_ONLY=${APPEND_ONLY:-0}
 
 M1_TASKS=(observe_and_pickup put_back_block rearrange_blocks swap_blocks swap_T)
 MN_TASKS=(battery_try blocks_ranking_try cover_blocks press_button place_block_mat classify_blocks storage_blocks)
@@ -49,15 +53,19 @@ for task in "${TASKS[@]}"; do
         continue
     fi
 
-    echo "================================================================"
-    echo "[convert] $task ($SCRIPT, $EPISODES episodes from demo_clean)"
-    rm -rf "lerobot_datasets/$task"
-    $PY "$SCRIPT" --task "$task" --episodes "$EPISODES"
+    if [ "$APPEND_ONLY" = "1" ] && [ -d "lerobot_datasets/$task" ]; then
+        echo "[skip-convert] $task (APPEND_ONLY=1, dataset exists)"
+    else
+        echo "================================================================"
+        echo "[convert] $task ($SCRIPT, $EPISODES episodes from demo_clean)"
+        rm -rf "lerobot_datasets/$task"
+        $PY "$SCRIPT" --task "$task" --episodes "$EPISODES"
+    fi
 
     # Append demo_clean_200 trajectories into the SAME dataset when available
     # (episode_id offset keeps ids unique: 0..49 then 50..249).
     if [ "$SKIP_200" = "0" ] && [[ " ${TASKS_200[*]} " == *" $task "* ]] \
-       && [ -d "$(dirname "$0")/../../data/$task/demo_clean_200" ]; then
+       && [ -d "$REPO_ROOT/data/$task/demo_clean_200" ]; then
         echo "[append] $task ($EPISODES_200 episodes from demo_clean_200)"
         $PY "$SCRIPT" --task "$task" --episodes "$EPISODES_200" \
             --demo-root demo_clean_200 --episode-id-offset "$EPISODES" --append
