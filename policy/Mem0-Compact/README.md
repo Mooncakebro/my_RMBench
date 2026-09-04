@@ -20,6 +20,10 @@ per frame:
 
 - Memory (M, P, e per layer; 16 slots × mem_dim 128) is threaded across frames,
   detached at TBPTT window boundaries, reset only at episode start.
+- Training data: demo_clean 50 eps/task; 4 tasks (put_back_block, swap_blocks,
+  cover_blocks, place_block_mat) additionally include demo_clean_200 (200 eps
+  appended, 250 total). Episode mapping reads meta/episodes/*.parquet (fast
+  path; avoids scanning + decoding every frame).
 - Aux losses: `L = 1.0·L_flow + 0.2·L_cls(Mn) + 0.01·L_obs + 0.01·L_nll + 0.001·L_mem`.
 - Classifier (4096 → 2048 → 512) disabled for M(1), enabled for M(n).
 - M(n) eval: SubtaskEndClassifier fires sub_end signals; threshold crossing saves
@@ -59,6 +63,10 @@ cd policy/Mem0-Compact
 
 # 1. data prep (lerobot v3.0 format) — all 12 tasks in one go:
 bash scripts/convert_all.sh
+# For the 4 tasks with demo_clean_200 (put_back_block, swap_blocks, cover_blocks,
+# place_block_mat) the 200 extra trajectories are APPENDED to the same dataset
+# (episode_id offset, 250 episodes total), and norm stats cover all episodes.
+# Env knobs: EPISODES=50 EPISODES_200=200 SKIP_200=1 (skip the append phase).
 # or single tasks:
 #   python scripts/hdf5_to_lerobot/M1_dataset_to_lerobot.py --task swap_blocks --episodes 50
 #   python scripts/hdf5_to_lerobot/Mn_dataset_to_lerobot.py --task cover_blocks --episodes 50

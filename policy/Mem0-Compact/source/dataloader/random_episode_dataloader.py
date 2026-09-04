@@ -106,20 +106,74 @@ class RandomEpisodeIterableDataset(IterableDataset):
     def _build_episode_mapping(self):
         """
         Build mapping from episode_id to list of frame indices.
-        First tries to read from episodes.jsonl (fast), falls back to scanning dataset (slow).
+        First tries to read episode metadata from disk (fast), falls back to
+        scanning the dataset (slow).
         """
         # Try to read from episodes.jsonl first (fast method)
         episodes_jsonl_path = self._get_episodes_jsonl_path()
-        
+        episodes_parquet_path = self._get_episodes_parquet_path()
+
         if episodes_jsonl_path and episodes_jsonl_path.exists():
             if self.rank == 0:
                 cprint(f"[RandomEpisodeDataset] Reading episode mapping from {episodes_jsonl_path}...", "cyan")
             self._build_episode_mapping_from_jsonl(episodes_jsonl_path)
+        elif episodes_parquet_path is not None:
+            # lerobot v3.0 stores meta/episodes/chunk-000/file-000.parquet
+            # (episode_index + length). MUCH faster than the scan fallback:
+            # scanning decodes every video frame (~150k frames for 250 eps).
+            if self.rank == 0:
+                cprint(f"[RandomEpisodeDataset] Reading episode mapping from {episodes_parquet_path}...", "cyan")
+            self._build_episode_mapping_from_parquet(episodes_parquet_path)
         else:
             # Fallback: scan dataset (slow method)
             if self.rank == 0:
                 cprint(f"[RandomEpisodeDataset] Building episode mapping by scanning {len(self.base_dataset)} samples...", "cyan")
             self._build_episode_mapping_from_scan()
+
+    def _get_episodes_parquet_path(self) -> Optional[Path]:
+        """Path to lerobot v3.0 meta/episodes/chunk-000/file-000.parquet."""
+        root = self._get_dataset_root()
+        if root is None:
+            return None
+        files = sorted((Path(root) / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+        return files[0] if files else None
+
+    def _get_dataset_root(self) -> Optional[Path]:
+        """Extract the lerobot dataset root dir from the wrapped dataset."""
+        if hasattr(self.base_dataset, "dataset") and hasattr(self.base_dataset.dataset, "root"):
+            return Path(self.base_dataset.dataset.root)
+        if hasattr(self.base_dataset, "root"):
+            return Path(self.base_dataset.root)
+        return None
+
+    def _build_episode_mapping_from_parquet(self, path: Path):
+        """Build mapping from the lerobot episodes parquet (fast method).
+
+        The parquet rows are in episode order (episodes are appended
+        sequentially by the converters), and data frames are stored
+        sequentially by episode, so each episode covers a contiguous range
+        of global sample indices. The mapping key is lerobot's episode_index,
+        which coincides with the stored `episode_id` feature (0..N-1).
+        """
+        import pandas as pd
+        df = pd.read_parquet(path)
+        self.episode_to_indices: Dict[int, List[int]] = {}
+        current_idx = 0
+        for ep_idx, length in zip(df["episode_index"].tolist(),
+                                  df["length"].tolist()):
+            length = int(length)
+            self.episode_to_indices[int(ep_idx)] = list(
+                range(current_idx, current_idx + length))
+            current_idx += length
+        if self.rank == 0:
+            total_episodes = len(self.episode_to_indices)
+            total_frames = sum(len(i) for i in self.episode_to_indices.values())
+            cprint(
+                f"[RandomEpisodeDataset] Built mapping from PARQUET: "
+                f"{BOLD}{total_episodes}{RESET_BOLD} episodes, "
+                f"{BOLD}{total_frames}{RESET_BOLD} total frames",
+                "green",
+            )
     
     def _get_episodes_jsonl_path(self) -> Optional[Path]:
         """

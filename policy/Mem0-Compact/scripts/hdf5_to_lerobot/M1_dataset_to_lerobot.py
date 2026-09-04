@@ -13,7 +13,24 @@ Mem0_workspace = os.path.join(workspace, "..", "..")
 parser = argparse.ArgumentParser()
 parser.add_argument("--task", type=str, default="swap_blocks")
 parser.add_argument("--episodes", type=int, default=50)
+parser.add_argument("--demo-root", type=str, default="demo_clean",
+                    help="raw data subdir (demo_clean | demo_clean_200)")
+parser.add_argument("--episode-id-offset", type=int, default=0,
+                    help="offset added to the stored episode_id feature "
+                         "(use the base dataset's episode count when appending)")
+parser.add_argument("--append", action="store_true",
+                    help="open the EXISTING lerobot dataset and append episodes "
+                         "(resume-recording path) instead of creating fresh")
+parser.add_argument("--dataset-root", type=str, default=None,
+                    help="override lerobot dataset root (default: "
+                         "lerobot_datasets/; useful for append tests on copies)")
 args = parser.parse_args()
+
+DEMO_ROOT = args.demo_root
+EPISODE_ID_OFFSET = args.episode_id_offset
+APPEND = args.append
+DATASET_ROOT = (Path(args.dataset_root)
+                if args.dataset_root else Path(Mem0_workspace) / "lerobot_datasets")
 
 # Define task names to process
 TASK_NAMES = [args.task]
@@ -67,18 +84,26 @@ total_episodes = 0
 total_frames = 0
 
 for dataset_name in TASK_NAMES:
-    # Create Lerobot dataset
+    # Create (fresh) or open (append) the Lerobot dataset
     lerobot_dataset_name = f"{dataset_name}"
-    dataset = LeRobotDataset.create(
-        repo_id=lerobot_dataset_name,
-        fps=30,
-        features=features,
-        root=Path(f"{Mem0_workspace}/lerobot_datasets/{lerobot_dataset_name}"),
-        use_videos=True,
-    )
-    
+    root = DATASET_ROOT / lerobot_dataset_name
+    if APPEND:
+        # Resume-recording: append episodes to the existing dataset.
+        dataset = LeRobotDataset(repo_id=lerobot_dataset_name, root=root)
+        print(f"[append] opened existing dataset at {root} "
+              f"({dataset.meta.total_episodes} episodes)")
+    else:
+        dataset = LeRobotDataset.create(
+            repo_id=lerobot_dataset_name,
+            fps=30,
+            features=features,
+            root=root,
+            use_videos=True,
+        )
+
     print(f"\n{'='*60}")
-    print(f"Processing task: {dataset_name}")
+    print(f"Processing task: {dataset_name} (root={DEMO_ROOT}, "
+          f"episode_id offset={EPISODE_ID_OFFSET}, append={APPEND})")
     print(f"{'='*60}")
     
     # User-defined subtask (same subtask used for the entire episode)
@@ -89,7 +114,7 @@ for dataset_name in TASK_NAMES:
         episode_key = f"episode_{episode_idx}"
         
         # Read hdf5 file
-        hdf5_path = f"{RMBench_workspace}/data/{dataset_name}/demo_clean/data/episode{episode_idx}.hdf5"
+        hdf5_path = f"{RMBench_workspace}/data/{dataset_name}/{DEMO_ROOT}/data/episode{episode_idx}.hdf5"
         
         try:
             with h5py.File(hdf5_path, "r") as f:
@@ -151,7 +176,10 @@ for dataset_name in TASK_NAMES:
                         "observation.image.head_camera": images[frame_idx],
                         "subtask": subtask_text,  # Same subtask used for the entire episode
                         "subtask_end": np.array([subtask_end], dtype=np.int32),  # shape: (1,)
-                        "episode_id": np.array([episode_idx], dtype=np.int32),  # shape: (1,)
+                        # Offset keeps episode_id unique across appended batches
+                        # (e.g. demo_clean_200 appends ids 50..249 after 0..49).
+                        "episode_id": np.array([EPISODE_ID_OFFSET + episode_idx],
+                                               dtype=np.int32),  # shape: (1,)
                         "task": dataset_name,  # lerobot 0.4.4: task is a required frame field
                     }
                     
