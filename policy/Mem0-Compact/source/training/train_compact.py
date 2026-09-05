@@ -101,6 +101,8 @@ def parse_args():
                    help="1 freezes the Qwen base (env FREEZE_BASE also honored)")
     p.add_argument("--grad-ckpt", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--profile-steps", type=int, default=0,
+                   help="print data/forward/backward timing for the first N steps")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--device", type=str,
@@ -159,8 +161,17 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         seed=int(cfg.get("dataloader", {}).get("seed", cfg.get("seed", 42))) + rank,
         infinite=bool(cfg.get("dataloader", {}).get("infinite", True)),
     )
-    loader = DataLoader(iterable, batch_size=batch_size,
-                        num_workers=num_workers, collate_fn=collate_batch)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "collate_fn": collate_batch,
+    }
+    if num_workers > 0:
+        loader_kwargs.update({
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+        })
+    loader = DataLoader(iterable, **loader_kwargs)
     return loader
 
 
@@ -173,6 +184,11 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg) -> None:
         "step": step,
         "config": OmegaConf.to_container(cfg, resolve=True),
     }, path)
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def main():
@@ -303,14 +319,21 @@ def main():
     step_times = []
     for step in range(start_step, max_steps):
         t0 = time.time()
+        profiling = args.profile_steps > 0 and (step - start_step) < args.profile_steps
+        profile_times = {"data": 0.0, "forward": 0.0}
         window_loss = torch.zeros((), device=device, dtype=torch.float32)
         log_parts = {}
         for k in range(window_size):
+            if profiling:
+                synchronize_device(device)
+                phase_start = time.perf_counter()
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(loader)
                 batch = next(data_iter)
+            if profiling:
+                profile_times["data"] += time.perf_counter() - phase_start
 
             ep_ids = batch["episode_id"].to(device)
 
@@ -328,7 +351,13 @@ def main():
             # Forward MUST go through the (DDP-wrapped) model — DDP.forward
             # registers the gradient-sync hooks; bypassing it would silently
             # skip gradient synchronization across ranks.
+            if profiling:
+                synchronize_device(device)
+                phase_start = time.perf_counter()
             loss_dict, memory = model(batch, memory)
+            if profiling:
+                synchronize_device(device)
+                profile_times["forward"] += time.perf_counter() - phase_start
             window_loss = window_loss + loss_dict["total"] / window_size
             if k == window_size - 1:
                 log_parts = {key: float(value.detach())
@@ -341,6 +370,9 @@ def main():
             memory = raw_model.detach_memory(memory)
             continue
 
+        if profiling:
+            synchronize_device(device)
+            phase_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         window_loss.backward()
         if grad_clip > 0:
@@ -348,6 +380,9 @@ def main():
                 [p for p in model.parameters() if p.requires_grad], grad_clip)
         optimizer.step()
         scheduler.step()
+        if profiling:
+            synchronize_device(device)
+            profile_times["backward_optimizer"] = time.perf_counter() - phase_start
 
         # TBPTT: gradients never cross windows.
         memory = raw_model.detach_memory(memory)
@@ -363,6 +398,13 @@ def main():
                         f"loss {window_loss.item():.4f} "
                         f"({parts}) lr {scheduler.get_last_lr()[0]:.2e} "
                         f"({avg_t:.2f}s/window)")
+        if profiling:
+            rank0_print(
+                f"[profile] step {step+1}: "
+                f"data={profile_times['data']:.2f}s "
+                f"forward={profile_times['forward']:.2f}s "
+                f"backward+optimizer={profile_times['backward_optimizer']:.2f}s"
+            )
         if save_every > 0 and (step + 1) % save_every == 0 and is_rank0():
             save_checkpoint(output_dir / f"ckpt_{step+1:07d}.pt",
                             raw_model, optimizer, scheduler, step + 1, cfg)

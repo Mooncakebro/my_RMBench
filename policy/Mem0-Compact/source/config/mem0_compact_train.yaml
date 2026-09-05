@@ -74,7 +74,7 @@ tbptt:
   detach_at_boundary: true
 
 dataloader:
-  num_workers: 0          # >0 works, but memory threading assumes batch-slot continuity
+  num_workers: 1          # keep at 1: temporal memory assumes batch-slot continuity
   shuffle_episodes: true
   seed: 42
   infinite: true

@@ -94,13 +94,13 @@ python source/training/train_compact.py \
 
 # 3. single-A800 server run (direct Python; safe starting batch)
 CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
-  EXTRA_ARGS="--grad-ckpt 1" bash source/training/train_ddp.sh
+  EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Output: runs/compact_swap_blocks/ckpt_final.pt
 
 # M(n) tasks use the classifier-enabled config (λ_cls=0.2 + focal BCE):
 CONFIG=source/config/mem0_compact_train_mn.yaml \
   CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
-  EXTRA_ARGS="--grad-ckpt 1" bash source/training/train_ddp.sh
+  EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Output: runs/compact_cover_blocks/ckpt_final.pt
 
 # 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU; start at
@@ -115,6 +115,7 @@ CONFIG=source/config/mem0_compact_train_mn.yaml \
 #     (episode % world_size == rank), global batch = batch_size x NPROC
 #   - memory state (M, P, e) is per-rank; no cross-rank coupling
 #   - window loss is averaged across ranks for logging only
+#   - keep `--num-workers 1`; multiple workers can break per-slot temporal order
 #   - single-GPU multi-rank debugging auto-falls back to gloo+cpu
 #     (NCCL refuses two ranks on one physical device)
 #   - DDP smoke test (tiny model, no VLM):
@@ -124,6 +125,9 @@ CONFIG=source/config/mem0_compact_train_mn.yaml \
 #         --task swap_blocks --freeze-base 1 --grad-ckpt 1 \
 #         --batch-size 1 --window-size 1 --opt-sgd --max-steps 4
 ```
+
+To diagnose utilization on a short run, add `--profile-steps 1` to
+`EXTRA_ARGS`. The trainer reports data, forward, and backward time separately.
 
 Note: `LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` is required in the
 lerobot env (conda libstdc++ must shadow the system one).
