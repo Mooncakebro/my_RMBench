@@ -82,12 +82,12 @@ dataloader:
 trainer:
   wandb_run_name: null
   resume: null
-  batch_size: 4           # local debug; server: 56 per A800
+  batch_size: 4           # local debug; server: start at 1 and scale
   max_steps: 100          # windows (local debug); server: 30000
   log_interval: 5
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
-  save_every_steps: 50
+  save_every_steps: 0
   save_final: true
   scheduler: cosine
   warmup_ratio: 0.05

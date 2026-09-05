@@ -56,9 +56,13 @@ policy/Mem0-Compact/
 └── debug/                            # smoke_forward / tbptt_check / test_deploy
 ```
 
-## Training (env: conda `lerobot`)
+## Data Preparation and Training
 
 ```bash
+# Use the LeRobot environment for conversion/training.
+conda activate lerobot
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
 cd policy/Mem0-Compact
 
 # 1. data prep (lerobot v3.0 format) — all 12 tasks in one go:
@@ -72,20 +76,36 @@ bash scripts/convert_all.sh
 #   python scripts/hdf5_to_lerobot/Mn_dataset_to_lerobot.py --task cover_blocks --episodes 50
 #   python scripts/gen_norm_stats.py --task swap_blocks
 
+# Transfer both generated trees to the same repo-relative paths on the server:
+#   policy/Mem0-Compact/lerobot_datasets/  (training data)
+#   policy/Mem0-Compact/assets/             (norm_stats.json + instructions)
+# Run these from the RMBench repo root on the machine containing the raw data:
+#   rsync -a --info=progress2 policy/Mem0-Compact/lerobot_datasets/ user@server:/path/to/RMBench/policy/Mem0-Compact/lerobot_datasets/
+#   rsync -a --info=progress2 policy/Mem0-Compact/assets/ user@server:/path/to/RMBench/policy/Mem0-Compact/assets/
+
 # 2. local debug run (8GB GPU escape hatches: window 1 + SGD)
 python source/training/train_compact.py \
     --config source/config/mem0_compact_train.yaml \
     --task swap_blocks --device cuda --freeze-base 1 \
     --batch-size 1 --max-steps 10 --window-size 1 --opt-sgd
 
-# 3. server run (8×A800, batch 56/rank, 30K windows)
-bash source/training/train_ddp.sh
-# M(n) tasks: use the classifier-enabled config (λ_cls=0.2 + focal BCE):
-#   CONFIG=source/config/mem0_compact_train_mn.yaml TASK=cover_blocks \
-#     bash source/training/train_ddp.sh
-# or explicitly:
-#   NPROC=8 TASK=swap_blocks BATCH_SIZE=56 MAX_STEPS=30000 \
-#     bash source/training/train_ddp.sh
+# Before server training, set execution_module.qwen_vl.model_path in the chosen
+# config YAML to the local Qwen3-VL-2B checkpoint (or allow Hugging Face access).
+
+# 3. single-A800 server run (safe starting batch; increase after a smoke run)
+CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  EXTRA_ARGS="--grad-ckpt 1" bash source/training/train_ddp.sh
+# Output: runs/compact_swap_blocks/ckpt_final.pt
+
+# M(n) tasks use the classifier-enabled config (λ_cls=0.2 + focal BCE):
+CONFIG=source/config/mem0_compact_train_mn.yaml \
+  CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  EXTRA_ARGS="--grad-ckpt 1" bash source/training/train_ddp.sh
+# Output: runs/compact_cover_blocks/ckpt_final.pt
+
+# 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU; start at
+# 1 and scale only after confirming memory use. Global batch = BATCH_SIZE*NPROC.
+# Periodic full checkpoints are disabled by default; only ckpt_final.pt is saved.
 #
 # DDP notes:
 #   - torchrun launches one rank per GPU; episodes are sharded per rank
@@ -105,26 +125,31 @@ bash source/training/train_ddp.sh
 Note: `LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` is required in the
 lerobot env (conda libstdc++ must shadow the system one).
 
-## Eval (env: conda `syb_RMBench`, SAPIEN present)
+## Evaluation (env: conda `syb_RMBench`, SAPIEN present)
 
 ```bash
 cd RMBench  # repo root
+conda activate syb_RMBench
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES=0
 
 # M(1)
 python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --overrides \
     --task_name swap_blocks --task_config demo_clean \
-    --execution_ckpt policy/Mem0-Compact/runs/.../ckpt_final.pt \
+    --execution_ckpt policy/Mem0-Compact/runs/compact_swap_blocks/ckpt_final.pt \
     --state_stats_path policy/Mem0-Compact/assets/swap_blocks/norm_stats.json \
-    --device cuda:0
+    --device cuda:0 \
+    --action_horizon 30
 
 # M(n): classifier is auto-enabled by task name; planner runs via vLLM
 # (start it first: vllm serve <merged-8B> --port 8123 or set --vllm_url)
 python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --overrides \
     --task_name cover_blocks --task_config demo_clean \
-    --execution_ckpt policy/Mem0-Compact/runs/.../ckpt_final.pt \
+    --execution_ckpt policy/Mem0-Compact/runs/compact_cover_blocks/ckpt_final.pt \
     --state_stats_path policy/Mem0-Compact/assets/cover_blocks/norm_stats.json \
     --vllm_url http://localhost:8123 \
-    --device cuda:0
+    --device cuda:0 \
+    --action_horizon 30
 ```
 
 Deploy pipeline check without SAPIEN (both task types):

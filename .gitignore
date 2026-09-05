@@ -42,3 +42,4 @@ assets/
 policy/Mem0-Compact/lerobot_datasets/
 policy/Mem0-Compact/runs/
 _tmp_visual/
+*.log

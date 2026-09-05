@@ -41,6 +41,8 @@ else
 fi
 
 export LD_LIBRARY_PATH=${CONDA_PREFIX:-/home/spc/anaconda3/envs/lerobot}/lib:$LD_LIBRARY_PATH
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${TMPDIR:-/tmp}/mem0_compact_hf_datasets}
+mkdir -p "$HF_DATASETS_CACHE"
 PY="python"   # assumes `lerobot` conda env is active
 
 for task in "${TASKS[@]}"; do
