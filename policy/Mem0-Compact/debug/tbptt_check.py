@@ -78,7 +78,7 @@ def main():
         for k in range(K):
             batch = next(data_iter)
             ep_ids = batch["episode_id"].to(device)
-            reset_mask = [(prev_episode[0] >= 0 and prev_episode[0] != ep_ids[0])]
+            reset_mask = [(prev_episode[0] < 0 or prev_episode[0] != ep_ids[0])]
             memory = model.reset_memory_rows(memory, reset_mask, device)
             cur_prev = prev_action.clone()
             if reset_mask[0]:

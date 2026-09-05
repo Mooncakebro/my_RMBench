@@ -64,7 +64,8 @@ def rank0_print(*args, **kwargs):
 def all_reduce_avg(t: torch.Tensor) -> torch.Tensor:
     """Average a tensor across ranks (in place). No-op for single process."""
     if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(t, op=dist.ReduceOp.AVG)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t.div_(dist.get_world_size())
     return t
 
 

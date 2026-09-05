@@ -4,7 +4,6 @@ import cv2
 import argparse
 import numpy as np
 from pathlib import Path
-import matplotlib.pyplot as plt
 import json
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -51,9 +50,11 @@ episode_num = args.episodes
 TASK_INSTRUCTIONS = {
     "battery_try": "There are two batteries and a battery slot on the table. Combining the two batteries in different orientations causes the dashboard needle to rotate.",
     "blocks_ranking_try": "There is a button and three colored cubes arranged in a random row on the table. Each time the cubes are rearranged, the arm presses the button until the arrangement is successful.",
-    "cover_blocks": "On the table, red, green, and blue blocks are arranged randomly along with three lids. From the current viewpoint, cover the blocks from right to left using the lids, and then uncover them again in the sequence red, green, and blue.",
+    "classify_blocks": "There are two colors of blocks and two baskets on the table. Collect blocks of the same color into the same basket.",
+    "cover_blocks": "On the table, red, green, and blue blocks are arranged randomly along with three lids. From the current viewpoint, cover the blocks from left to right using the lids, and then uncover them again in the sequence red, green, and blue.",
     "press_button": "Observe the two numbers on the table. Press the left button the number of times corresponding to the number on the left, and press the middle button the number of times corresponding to the number on the right. Then press the right button once to confirm.",
     "place_block_mat": "Pick up the blocks from the blue mat and place them on the green mat, then put them back on the original mat, starting from left to right.",
+    "storage_blocks": "There are blocks and a basket on the table. Store all the blocks on the table into the basket.",
 }
 
 lerobot_dataset_name = args.task
@@ -124,7 +125,9 @@ for dataset_name in task_pbar:
     task_pbar.set_description(f"Processing task: {dataset_name}")
     
     # Get global task instruction for current task
-    global_task_text = TASK_INSTRUCTIONS.get(dataset_name, "")
+    if dataset_name not in TASK_INSTRUCTIONS:
+        raise ValueError(f"No global instruction configured for M(n) task: {dataset_name}")
+    global_task_text = TASK_INSTRUCTIONS[dataset_name]
     
     # Read language annotation file for current task
     annotation_path = Path(f"{RMBench_workspace}/data/{dataset_name}/{DEMO_ROOT}/language_annotation.json")
@@ -154,21 +157,39 @@ for dataset_name in task_pbar:
                 
                 # Process language annotations (if they exist)
                 subtask_boundaries = []
-                if episode_key in language_annotations:
-                    # Get task annotations for current episode
-                    episode_annotations = language_annotations[episode_key]
-                    
-                    # Calculate boundary range for each subtask [start_idx, end_idx, subtask_text]
-                    # Do not merge adjacent identical subtasks, maintain independence of original annotations
-                    current_idx = 0
-                    for subtask_info in episode_annotations:
-                        subtask_text = subtask_info[0]
-                        duration = subtask_info[1]
-                        
-                        start_idx = current_idx
-                        end_idx = current_idx + duration - 1
-                        subtask_boundaries.append([start_idx, end_idx, subtask_text])
-                        current_idx = end_idx + 1
+                if episode_key not in language_annotations:
+                    raise ValueError(f"Missing language annotation for {episode_key}")
+
+                episode_annotations = language_annotations[episode_key]
+                if not isinstance(episode_annotations, list) or not episode_annotations:
+                    raise ValueError(f"Invalid language annotation list for {episode_key}")
+
+                current_idx = 0
+                for annotation_idx, subtask_info in enumerate(episode_annotations):
+                    if not isinstance(subtask_info, (list, tuple)) or len(subtask_info) != 2:
+                        raise ValueError(
+                            f"Invalid annotation {episode_key}[{annotation_idx}]: {subtask_info!r}"
+                        )
+                    subtask_text, duration = subtask_info
+                    if not isinstance(subtask_text, str) or not subtask_text.strip():
+                        raise ValueError(
+                            f"Empty subtask text in {episode_key}[{annotation_idx}]"
+                        )
+                    if isinstance(duration, bool) or int(duration) != duration or int(duration) <= 0:
+                        raise ValueError(
+                            f"Invalid duration in {episode_key}[{annotation_idx}]: {duration!r}"
+                        )
+                    duration = int(duration)
+                    start_idx = current_idx
+                    end_idx = current_idx + duration - 1
+                    subtask_boundaries.append([start_idx, end_idx, subtask_text])
+                    current_idx = end_idx + 1
+
+                if current_idx != episode_length:
+                    raise ValueError(
+                        f"Annotation durations for {episode_key} sum to {current_idx}, "
+                        f"but episode has {episode_length} frames"
+                    )
                 
                 # Pre-read all frame states to calculate actions (current frame's state is used as previous frame's action)
                 states = []
@@ -179,7 +200,10 @@ for dataset_name in task_pbar:
                 for frame_idx in frame_load_iter:
                     # Get image
                     image_bits = f["observation"]["head_camera"]["rgb"][frame_idx]
-                    image_rgb = cv2.imdecode(np.frombuffer(image_bits, np.uint8), cv2.IMREAD_COLOR)
+                    image_bgr = cv2.imdecode(np.frombuffer(image_bits, np.uint8), cv2.IMREAD_COLOR)
+                    if image_bgr is None:
+                        raise ValueError(f"failed to decode head-camera image at frame {frame_idx}")
+                    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
                     images.append(image_rgb)
                     
                     # Get joint states
@@ -224,7 +248,7 @@ for dataset_name in task_pbar:
                                 current_subtask = subtask_text
                                 # Check if close to subtask boundary (distance to boundary <= 8)
                                 distance_to_end = end_idx - frame_idx
-                                if distance_to_end < 8:
+                                if distance_to_end <= 8:
                                     subtask_end = True
                                 break
                     
@@ -260,6 +284,7 @@ for dataset_name in task_pbar:
             episode_iter.set_postfix_str(f"✗ Error: {str(e)[:30]}")
             import traceback
             traceback.print_exc()
+            raise
 
     # lerobot 0.4.4: must finalize to write parquet footers + episodes metadata
     dataset.finalize()

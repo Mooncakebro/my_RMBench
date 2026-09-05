@@ -98,7 +98,7 @@ trainer:
     qwen_model: 1.0e-5
     action_model: 1.0e-4
     classifier: 1.0e-4
-    memory: 5.0e-6        # side memory + action_embed + prev_action_mlp
+    memory: 5.0e-6        # side-memory modules only
 
 vla_dataset:
   RMBench:

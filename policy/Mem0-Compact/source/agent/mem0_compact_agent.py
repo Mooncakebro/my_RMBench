@@ -51,7 +51,16 @@ class Mem0CompactAgent:
         self.episode_id = 0
         self.is_init = 0
 
-        self.action_horizon = self.config.get("action_horizon", 30)
+        nested_horizon = int(self.config.execution_module.action_model.get(
+            "action_horizon", 30))
+        top_horizon = self.config.get("action_horizon", nested_horizon)
+        if top_horizon is not None and int(top_horizon) != nested_horizon:
+            raise ValueError(
+                "action_horizon mismatch between top-level deployment config "
+                f"({top_horizon}) and execution_module.action_model "
+                f"({nested_horizon})"
+            )
+        self.action_horizon = nested_horizon
         self.action_strip = self.action_horizon
         self.threshold = self.config.get("threshold", 2)
 
@@ -108,8 +117,64 @@ class Mem0CompactAgent:
                                  weights_only=False, mmap=True)
         except TypeError:  # older torch without mmap support
             payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state_dict = payload.get("model_state_dict", payload.get("model", payload))
+        checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
+        if checkpoint_config is None:
+            raise ValueError(
+                "checkpoint has no saved config; refusing to load it because "
+                "Mem0-Compact architecture compatibility cannot be verified"
+            )
+
+        def config_value(config, path):
+            current = config
+            for key in path.split("."):
+                if hasattr(current, "get"):
+                    current = current.get(key)
+                elif isinstance(current, dict):
+                    current = current.get(key)
+                else:
+                    return None
+                if current is None:
+                    return None
+            return current
+
+        fields = (
+            ("execution_module.compact.mem_dim", int),
+            ("execution_module.compact.num_mem_tokens", int),
+            ("execution_module.compact.num_heads", int),
+            ("execution_module.compact.num_obs_tokens", int),
+            ("execution_module.action_model.action_model_type", str),
+            ("execution_module.action_model.action_dim", int),
+            ("execution_module.action_model.state_dim", int),
+            ("execution_module.action_model.action_horizon", int),
+            ("execution_module.action_model.num_inference_timesteps", int),
+            ("execution_module.use_classifier", bool),
+        )
+        mismatches = []
+        for path, cast in fields:
+            expected = config_value(self.config, path)
+            actual = config_value(checkpoint_config, path)
+            if expected is None or actual is None:
+                mismatches.append(f"{path}: missing (runtime={expected}, checkpoint={actual})")
+                continue
+            if cast(actual) != cast(expected):
+                mismatches.append(
+                    f"{path}: runtime={cast(expected)!r}, checkpoint={cast(actual)!r}"
+                )
+        if mismatches:
+            raise ValueError(
+                "checkpoint architecture does not match deployment config:\n- "
+                + "\n- ".join(mismatches)
+            )
+
+        state_dict = payload.get("model_state_dict", payload.get("model"))
+        if state_dict is None:
+            raise ValueError(f"checkpoint contains no model state: {ckpt_path}")
         missing, unexpected = self.executor.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "checkpoint state is incompatible with the reconstructed model: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         del payload, state_dict
         cprint(f"[Mem0-Compact] loaded ckpt {ckpt_path} "
                f"(missing={len(missing)}, unexpected={len(unexpected)})", "green")
@@ -197,9 +262,8 @@ class Mem0CompactAgent:
         if self._last_summary is None:
             cprint("[Mem0-Compact] obs cache empty; call update_obs first", "red")
             return None
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.executor.action_model.predict_action(
-                self._last_summary, self._last_state)
+        pred_actions = self.executor.action_model.predict_action(
+            self._last_summary, self._last_state)
         if pred_actions is None:
             return None
         return {"normalized_actions": pred_actions.detach().cpu().numpy()}

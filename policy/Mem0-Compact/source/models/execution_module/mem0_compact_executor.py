@@ -437,16 +437,21 @@ class Mem0CompactExecutor(nn.Module):
 
         decay, no_decay = [], []
         for name, p in self.action_model.named_parameters():
-            (decay if use_wd(name) else no_decay).append(p)
+            if p.requires_grad:
+                (decay if use_wd(name) else no_decay).append(p)
         if self.classifier is not None:
             for name, p in self.classifier.named_parameters():
-                (decay if use_wd(name) else no_decay).append(p)
+                if p.requires_grad:
+                    (decay if use_wd(name) else no_decay).append(p)
 
-        mem_params = (
-            [p for p in self.wrapper.side_memories.parameters() if p.requires_grad]
-            + [p for p in self.wrapper.action_embed.parameters() if p.requires_grad]
-            + [p for p in self.prev_action_mlp.parameters() if p.requires_grad]
-        )
+        for name, p in self.wrapper.action_embed.named_parameters():
+            (decay if use_wd(f"action_embed.{name}") else no_decay).append(p)
+        for name, p in self.prev_action_mlp.named_parameters():
+            (decay if use_wd(f"prev_action_mlp.{name}") else no_decay).append(p)
+
+        mem_params = [
+            p for p in self.wrapper.side_memories.parameters() if p.requires_grad
+        ]
         base_params = [p for p in self.wrapper.llm.parameters() if p.requires_grad]
 
         groups = [
@@ -468,8 +473,8 @@ class Mem0CompactExecutor(nn.Module):
         return {
             "base_trainable": count(self.wrapper.llm.parameters()),
             "base_total": sum(p.numel() for p in self.wrapper.llm.parameters()),
-            "side_memory": count(self.wrapper.side_memories.parameters())
-                           + count(self.wrapper.action_embed.parameters()),
+            "side_memory": count(self.wrapper.side_memories.parameters()),
+            "action_embed": count(self.wrapper.action_embed.parameters()),
             "prev_action_mlp": count(self.prev_action_mlp.parameters()),
             "action_head": count(self.action_model.parameters()),
             "classifier": count(self.classifier.parameters()) if self.classifier else 0,

@@ -61,7 +61,7 @@ class LeRobot_Selective_Dataset(LeRobotDataset):
         features_to_load: Optional[List[str]] = None,
         image_scale: Optional[Tuple[int, int]] = (224, 224),
         fps: int = 30,
-        action_horizon: int = 16,
+        action_horizon: int = 30,
         video_backend: str = "pyav",
         **kwargs
     ):
@@ -287,7 +287,7 @@ class LeRobot_Dataset(Dataset):
         features_to_load: Optional[List[str]] = None,
         image_scale: Optional[Tuple[int, int]] = (224, 224),
         fps: int = 30,
-        action_horizon: int = 16,
+        action_horizon: int = 30,
         video_backend: str = "pyav",
         norm_stats_path: Optional[str] = None,
         **kwargs
@@ -304,10 +304,28 @@ class LeRobot_Dataset(Dataset):
         
         self.norm_stats_path = norm_stats_path
         if self.norm_stats_path is not None:
-            self.state_min = torch.tensor(json.load(open(self.norm_stats_path, "r"))["state_min"]).float()
-            self.state_max = torch.tensor(json.load(open(self.norm_stats_path, "r"))["state_max"]).float()
-            self.action_min = torch.tensor(json.load(open(self.norm_stats_path, "r"))["action_min"]).float()
-            self.action_max = torch.tensor(json.load(open(self.norm_stats_path, "r"))["action_max"]).float()
+            with open(self.norm_stats_path, "r", encoding="utf-8") as f:
+                norm_stats = json.load(f)
+            required_stats = {"state_min", "state_max", "action_min", "action_max"}
+            missing_stats = required_stats - norm_stats.keys()
+            if missing_stats:
+                raise ValueError(
+                    f"Normalization file {self.norm_stats_path} is missing: "
+                    f"{sorted(missing_stats)}"
+                )
+            self.state_min = torch.tensor(norm_stats["state_min"]).float()
+            self.state_max = torch.tensor(norm_stats["state_max"]).float()
+            self.action_min = torch.tensor(norm_stats["action_min"]).float()
+            self.action_max = torch.tensor(norm_stats["action_max"]).float()
+            for name, values in (("state_min", self.state_min),
+                                 ("state_max", self.state_max),
+                                 ("action_min", self.action_min),
+                                 ("action_max", self.action_max)):
+                if values.numel() != 16:
+                    raise ValueError(
+                        f"Normalization field {name} must contain 16 values, "
+                        f"got shape {tuple(values.shape)}"
+                    )
             
     def __len__(self):
         return len(self.dataset)
@@ -445,8 +463,18 @@ class LeRobot_Dataset(Dataset):
             if torch.isnan(action_normalized[:, action_normalize_mask]).any() or torch.isinf(action_normalized[:, action_normalize_mask]).any():
                 raise ValueError(f"Action normalization produced NaN/Inf values. Check action_min/max stats.")
 
-        # get subtask from sample
+        # get language fields from sample
         subtask = sample["subtask"]
+        if isinstance(subtask, (list, tuple)):
+            subtask = subtask[0] if subtask else ""
+        if isinstance(subtask, torch.Tensor):
+            subtask = subtask.item() if subtask.numel() == 1 else str(subtask.tolist())
+
+        global_task = sample.get("global_task", "")
+        if isinstance(global_task, (list, tuple)):
+            global_task = global_task[0] if global_task else ""
+        if isinstance(global_task, torch.Tensor):
+            global_task = global_task.item() if global_task.numel() == 1 else str(global_task.tolist())
         
         # episode_id from sample
         episode_id = sample["episode_id"]
@@ -473,6 +501,7 @@ class LeRobot_Dataset(Dataset):
             "episode_pos": frame_index,  # offset within episode
             "global_idx": global_idx,  # global sample index
             "subtask_end": int(subtask_end) if isinstance(subtask_end, torch.Tensor) else subtask_end,  # int
+            "global_task": global_task,
         }
 
 

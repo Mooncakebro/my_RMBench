@@ -37,15 +37,19 @@ def main():
             "observation.state",
             "action",
             "subtask",
+            "global_task",
             "subtask_end",
             "episode_id",
         ],
     )
     sample = dataset[0]
     print(f"instruction: {sample['lang']}")
+    if sample.get("global_task"):
+        print(f"global task: {sample['global_task']}")
     print(f"action: {sample['action'].shape}  state: {sample['state'].shape}")
 
-    norm_path = save_norm_stats(dataset, args.task, sample["lang"])
+    instruction = sample.get("global_task") or sample["lang"]
+    norm_path = save_norm_stats(dataset, args.task, instruction)
     print(f"Saved norm stats to {norm_path}")
 
 

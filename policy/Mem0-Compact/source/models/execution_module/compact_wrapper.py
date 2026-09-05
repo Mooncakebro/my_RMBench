@@ -177,6 +177,9 @@ class CompactModeWrapper(JAMELCompactWrapper):
             else:
                 h_layer = layer_output
 
+            m_hat = m_hat.to(h_layer.dtype)
+            p_hat = p_hat.to(h_layer.dtype)
+
             # 4b.5 DeepStack injection (Qwen3-VL adds visual features to
             #      early decoder layers' hidden states at image positions)
             if deepstack_features and l < len(deepstack_features):

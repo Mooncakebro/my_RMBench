@@ -128,7 +128,10 @@ for dataset_name in TASK_NAMES:
                 for frame_idx in range(episode_length):
                     # Get image
                     image_bits = f["observation"]["head_camera"]["rgb"][frame_idx]
-                    image_rgb = cv2.imdecode(np.frombuffer(image_bits, np.uint8), cv2.IMREAD_COLOR)
+                    image_bgr = cv2.imdecode(np.frombuffer(image_bits, np.uint8), cv2.IMREAD_COLOR)
+                    if image_bgr is None:
+                        raise ValueError(f"failed to decode head-camera image at frame {frame_idx}")
+                    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
                     images.append(image_rgb)
                     
                     # Get joint states
@@ -199,6 +202,7 @@ for dataset_name in TASK_NAMES:
             print(f"  ✗ Error: {dataset_name}/{episode_key}: {e}")
             import traceback
             traceback.print_exc()
+            raise
 
     # lerobot 0.4.4: must finalize to write parquet footers + episodes metadata
     dataset.finalize()

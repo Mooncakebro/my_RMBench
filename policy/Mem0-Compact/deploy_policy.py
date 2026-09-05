@@ -137,6 +137,18 @@ def get_model(usr_args: dict) -> Mem0CompactAgent:
     _load_stats(stats_path)
     cfg = OmegaConf.create(usr_args)
 
+    # Keep the public deployment horizon and the DiT horizon identical. CLI
+    # overrides only update the top-level YAML dictionary.
+    top_horizon = cfg.get("action_horizon", None)
+    nested_horizon = OmegaConf.select(
+        cfg, "execution_module.action_model.action_horizon", default=None)
+    if top_horizon is None and nested_horizon is not None:
+        cfg.action_horizon = int(nested_horizon)
+    elif top_horizon is not None:
+        OmegaConf.update(
+            cfg, "execution_module.action_model.action_horizon",
+            int(top_horizon), merge=False)
+
     # M(n) tasks need the SubtaskEndClassifier (flat CLI overrides cannot
     # reach nested config keys, so force it here based on the task name).
     task_name = str(usr_args.get("task_name", ""))

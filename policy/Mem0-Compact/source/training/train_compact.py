@@ -163,11 +163,12 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
     return loader
 
 
-def save_checkpoint(path: Path, model, optimizer, step, cfg) -> None:
+def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
         "step": step,
         "config": OmegaConf.to_container(cfg, resolve=True),
     }, path)
@@ -203,6 +204,11 @@ def main():
     # TBPTT window
     tbptt_cfg = cfg.get("tbptt", {})
     window_size = args.window_size or int(tbptt_cfg.get("window_size", 8))
+    if not bool(tbptt_cfg.get("detach_at_boundary", True)):
+        raise ValueError(
+            "tbptt.detach_at_boundary=false is unsupported with per-window "
+            "optimizer updates; set it to true"
+        )
     grad_clip = float(trainer_cfg.get("grad_clip_norm", 2.5))
     warmup_ratio = float(trainer_cfg.get("warmup_ratio", 0.05))
 
@@ -212,8 +218,9 @@ def main():
     memory_lr = float(lr_cfg.get("memory", 5e-6))
     weight_decay = float(trainer_cfg.get("weight_decay", 0.005))
 
-    output_dir = Path(args.output_dir or trainer_cfg.get(
-        "checkpoint_dir", str(PROJECT_ROOT / "runs" / "compact")))
+    configured_output_dir = args.output_dir or trainer_cfg.get("checkpoint_dir")
+    output_dir = (Path(configured_output_dir) if configured_output_dir
+                  else PROJECT_ROOT / "runs" / "compact")
     output_dir.mkdir(parents=True, exist_ok=True)
     if is_rank0():
         with (output_dir / "config.yaml").open("w") as f:
@@ -251,17 +258,28 @@ def main():
     scheduler = LambdaLR(optimizer, make_lr_lambda(max_steps, warmup_ratio))
 
     start_step = 0
-    if args.resume and args.resume.exists():
+    configured_resume = args.resume or trainer_cfg.get("resume")
+    resume_path = Path(configured_resume).expanduser() if configured_resume else None
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
         try:
-            ckpt = torch.load(args.resume, map_location="cpu",
+            ckpt = torch.load(resume_path, map_location="cpu",
                               weights_only=False, mmap=True)
         except TypeError:
-            ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        raw_model.load_state_dict(ckpt["model"], strict=False)
+            ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        missing, unexpected = raw_model.load_state_dict(ckpt["model"], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"resume checkpoint is incompatible: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_step = ckpt["step"]
         del ckpt
-        rank0_print(f"[train] resumed from {args.resume} at step {start_step}")
+        rank0_print(f"[train] resumed from {resume_path} at step {start_step}")
 
     # ── Data (episodes sharded per rank; global batch = batch * world_size) ──
     loader = build_dataloader(cfg, args.task, rank=rank, world_size=world_size,
@@ -292,7 +310,7 @@ def main():
             ep_ids = batch["episode_id"].to(device)
 
             # Per-slot episode reset: memory + prev_action + episode tracker.
-            reset_mask = [(prev_episode[i] >= 0 and prev_episode[i] != ep_ids[i])
+            reset_mask = [(prev_episode[i] < 0 or prev_episode[i] != ep_ids[i])
                           for i in range(batch_size)]
             memory = raw_model.reset_memory_rows(memory, reset_mask, device)
             prev_action = batch["state"].squeeze(1).to(device).clone().detach()
@@ -342,12 +360,15 @@ def main():
                         f"({avg_t:.2f}s/window)")
         if save_every > 0 and (step + 1) % save_every == 0 and is_rank0():
             save_checkpoint(output_dir / f"ckpt_{step+1:07d}.pt",
-                            raw_model, optimizer, step + 1, cfg)
+                            raw_model, optimizer, scheduler, step + 1, cfg)
 
-    if is_rank0():
+    if is_rank0() and bool(trainer_cfg.get("save_final", True)):
         save_checkpoint(output_dir / "ckpt_final.pt", raw_model, optimizer,
-                        max_steps, cfg)
+                        scheduler, max_steps, cfg)
         rank0_print(f"[train] done. {max_steps} windows. Saved to {output_dir}")
+    elif is_rank0():
+        rank0_print(f"[train] done. {max_steps} windows. Final checkpoint disabled; "
+                    f"periodic checkpoints are in {output_dir}")
     destroy_distributed()
 
 
