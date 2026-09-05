@@ -23,8 +23,9 @@ Loss per frame:
 DDP notes:
   - forward must go through `model(batch, memory)` (DDP.forward) — calling
     inner methods directly would skip gradient sync.
-  - find_unused_parameters=True (dynamic graph edges: e_prev=None at window
-    starts; classifier absent for M(1)).
+  - single-GPU runs are not wrapped in DDP; multi-GPU runs use
+    find_unused_parameters=True normally and static_graph=True when gradient
+    checkpointing is enabled.
   - per-rank batch_size is the config value; global batch = batch * world_size.
   - checkpointing/logging are rank-0-only; window loss is all-reduced for logs.
 
@@ -239,9 +240,13 @@ def main():
     rank0_print("[train] building executor (this loads Qwen3-VL-2B)...")
     model = Mem0CompactExecutor(cfg, device=device).to(device)
     if ddp_enabled:
+        gradient_checkpointing = bool(
+            cfg.execution_module.compact.get("gradient_checkpointing", False)
+        )
         model = DDP(model,
                     device_ids=[device.index] if device.type == "cuda" else None,
-                    find_unused_parameters=True)
+                    find_unused_parameters=not gradient_checkpointing,
+                    static_graph=gradient_checkpointing)
     raw_model = model.module if ddp_enabled else model
     if is_rank0():
         counts = raw_model.trainable_param_counts()

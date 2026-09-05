@@ -35,6 +35,8 @@ def setup_distributed() -> Tuple[int, int, int, bool]:
         world_size = int(os.environ["WORLD_SIZE"])
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if world_size <= 1:
+            return 0, 1, local_rank, False
         backend = _backend_for(world_size)
         dist.init_process_group(backend=backend)
         if backend == "nccl":

@@ -92,7 +92,7 @@ python source/training/train_compact.py \
 # Before server training, set execution_module.qwen_vl.model_path in the chosen
 # config YAML to the local Qwen3-VL-2B checkpoint (or allow Hugging Face access).
 
-# 3. single-A800 server run (safe starting batch; increase after a smoke run)
+# 3. single-A800 server run (direct Python; safe starting batch)
 CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
   EXTRA_ARGS="--grad-ckpt 1" bash source/training/train_ddp.sh
 # Output: runs/compact_swap_blocks/ckpt_final.pt
@@ -108,7 +108,10 @@ CONFIG=source/config/mem0_compact_train_mn.yaml \
 # Periodic full checkpoints are disabled by default; only ckpt_final.pt is saved.
 #
 # DDP notes:
-#   - torchrun launches one rank per GPU; episodes are sharded per rank
+#   - NPROC=1 uses direct Python; NPROC>1 uses torchrun, one rank per GPU
+#   - with gradient checkpointing, multi-GPU DDP uses static_graph mode to
+#     avoid reentrant checkpoint reducer errors
+#   - episodes are sharded per rank
 #     (episode % world_size == rank), global batch = batch_size x NPROC
 #   - memory state (M, P, e) is per-rank; no cross-rank coupling
 #   - window loss is averaged across ranks for logging only
