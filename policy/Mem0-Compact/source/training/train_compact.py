@@ -49,6 +49,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -103,6 +104,12 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--profile-steps", type=int, default=0,
                    help="print data/forward/backward timing for the first N steps")
+    p.add_argument("--save-best", type=int, default=None,
+                   help="1 saves ckpt_best.pt using the all-reduced training loss")
+    p.add_argument("--best-start-step", type=int, default=None,
+                   help="start considering best-loss checkpoints at this 1-based step")
+    p.add_argument("--best-min-delta", type=float, default=None,
+                   help="minimum loss improvement required before overwriting ckpt_best.pt")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--device", type=str,
@@ -175,15 +182,29 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
     return loader
 
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg) -> None:
+def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg,
+                    best_loss: Optional[float] = None,
+                    best_step: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
         "config": OmegaConf.to_container(cfg, resolve=True),
-    }, path)
+    }
+    if best_loss is not None:
+        checkpoint["best_loss"] = float(best_loss)
+    if best_step is not None:
+        checkpoint["best_step"] = int(best_step)
+
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -213,10 +234,23 @@ def main():
     trainer_cfg = cfg.trainer
     if args.max_steps is not None:
         trainer_cfg.max_steps = int(args.max_steps)
+    if args.save_best is not None:
+        trainer_cfg.save_best = bool(args.save_best)
+    if args.best_start_step is not None:
+        trainer_cfg.best_checkpoint_start_step = int(args.best_start_step)
+    if args.best_min_delta is not None:
+        trainer_cfg.best_checkpoint_min_delta = float(args.best_min_delta)
     max_steps = int(trainer_cfg.get("max_steps", 100))
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
     log_interval = int(trainer_cfg.get("log_interval", 5))
-    save_every = int(trainer_cfg.get("save_every_steps", 100))
+    save_every = int(trainer_cfg.get("save_every_steps", 0))
+    save_best = bool(trainer_cfg.get("save_best", False))
+    best_start_step = max(
+        1, int(trainer_cfg.get("best_checkpoint_start_step", 1000))
+    )
+    best_min_delta = max(
+        0.0, float(trainer_cfg.get("best_checkpoint_min_delta", 0.0))
+    )
 
     # TBPTT window
     tbptt_cfg = cfg.get("tbptt", {})
@@ -244,6 +278,11 @@ def main():
             f.write(OmegaConf.to_yaml(cfg))
     rank0_print(f"[train] output_dir={output_dir} ddp={ddp_enabled} "
                 f"rank={rank}/{world_size}")
+    rank0_print(
+        f"[train] checkpoints: best={save_best} (start={best_start_step}, "
+        f"min_delta={best_min_delta:g}), every={save_every}, final="
+        f"{bool(trainer_cfg.get('save_final', True))}"
+    )
 
     seed = int(cfg.get("seed", 42))
     torch.manual_seed(seed + rank)
@@ -279,6 +318,8 @@ def main():
     scheduler = LambdaLR(optimizer, make_lr_lambda(max_steps, warmup_ratio))
 
     start_step = 0
+    best_loss = float("inf")
+    best_step = None
     configured_resume = args.resume or trainer_cfg.get("resume")
     resume_path = Path(configured_resume).expanduser() if configured_resume else None
     if resume_path is not None:
@@ -299,6 +340,14 @@ def main():
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
         start_step = ckpt["step"]
+        checkpoint_best_loss = ckpt.get("best_loss")
+        if checkpoint_best_loss is not None:
+            checkpoint_best_loss = float(checkpoint_best_loss)
+            if math.isfinite(checkpoint_best_loss):
+                best_loss = checkpoint_best_loss
+        checkpoint_best_step = ckpt.get("best_step")
+        if checkpoint_best_step is not None:
+            best_step = int(checkpoint_best_step)
         del ckpt
         rank0_print(f"[train] resumed from {resume_path} at step {start_step}")
 
@@ -405,13 +454,44 @@ def main():
                 f"forward={profile_times['forward']:.2f}s "
                 f"backward+optimizer={profile_times['backward_optimizer']:.2f}s"
             )
+
+        current_loss = float(window_loss.detach().item())
+        if (
+            save_best
+            and is_rank0()
+            and (step + 1) >= best_start_step
+            and current_loss < best_loss - best_min_delta
+        ):
+            best_loss = current_loss
+            best_step = step + 1
+            save_checkpoint(
+                output_dir / "ckpt_best.pt",
+                raw_model,
+                optimizer,
+                scheduler,
+                best_step,
+                cfg,
+                best_loss=best_loss,
+                best_step=best_step,
+            )
+            rank0_print(
+                f"[train] new best loss {best_loss:.6f} at step {best_step}; "
+                f"saved {output_dir / 'ckpt_best.pt'}"
+            )
+
         if save_every > 0 and (step + 1) % save_every == 0 and is_rank0():
             save_checkpoint(output_dir / f"ckpt_{step+1:07d}.pt",
-                            raw_model, optimizer, scheduler, step + 1, cfg)
+                            raw_model, optimizer, scheduler, step + 1, cfg,
+                            best_loss=(best_loss if math.isfinite(best_loss)
+                                       else None),
+                            best_step=best_step)
 
     if is_rank0() and bool(trainer_cfg.get("save_final", True)):
         save_checkpoint(output_dir / "ckpt_final.pt", raw_model, optimizer,
-                        scheduler, max_steps, cfg)
+                        scheduler, max_steps, cfg,
+                        best_loss=(best_loss if math.isfinite(best_loss)
+                                   else None),
+                        best_step=best_step)
         rank0_print(f"[train] done. {max_steps} windows. Saved to {output_dir}")
     elif is_rank0():
         rank0_print(f"[train] done. {max_steps} windows. Final checkpoint disabled; "

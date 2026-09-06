@@ -95,17 +95,24 @@ python source/training/train_compact.py \
 # 3. single-A800 server run (direct Python; safe starting batch)
 CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
-# Output: runs/compact_swap_blocks/ckpt_final.pt
+# Outputs: runs/compact_swap_blocks/ckpt_best.pt and ckpt_final.pt
 
 # M(n) tasks use the classifier-enabled config (λ_cls=0.2 + focal BCE):
 CONFIG=source/config/mem0_compact_train_mn.yaml \
   CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
-# Output: runs/compact_cover_blocks/ckpt_final.pt
+# Outputs: runs/compact_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
 # 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU; start at
 # 1 and scale only after confirming memory use. Global batch = BATCH_SIZE*NPROC.
-# Periodic full checkpoints are disabled by default; only ckpt_final.pt is saved.
+# Checkpoint policy:
+#   - after step 1000, save_best=true overwrites ckpt_best.pt whenever the
+#     all-reduced TBPTT window loss reaches a new minimum
+#   - ckpt_final.pt is saved at normal training completion
+#   - save_every_steps=0 disables additional numbered full checkpoints
+#   - best_checkpoint_min_delta can reduce noisy/repeated best saves
+#   - this is training-loss selection; no validation loop is implemented yet
+#   - both files are full resume checkpoints (model + optimizer + scheduler)
 #
 # DDP notes:
 #   - NPROC=1 uses direct Python; NPROC>1 uses torchrun, one rank per GPU

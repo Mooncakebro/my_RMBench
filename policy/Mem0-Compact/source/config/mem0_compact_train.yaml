@@ -87,7 +87,10 @@ trainer:
   log_interval: 5
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
-  save_every_steps: 3000
+  save_every_steps: 0     # optional fixed full checkpoints; 0 disables them
+  save_best: true         # overwrite one full checkpoint when train loss improves
+  best_checkpoint_start_step: 1000
+  best_checkpoint_min_delta: 0.0
   save_final: true
   scheduler: cosine
   warmup_ratio: 0.05
