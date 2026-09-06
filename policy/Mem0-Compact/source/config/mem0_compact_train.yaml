@@ -87,7 +87,7 @@ trainer:
   log_interval: 5
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
-  save_every_steps: 0
+  save_every_steps: 3000
   save_final: true
   scheduler: cosine
   warmup_ratio: 0.05
