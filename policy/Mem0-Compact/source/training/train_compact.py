@@ -110,6 +110,10 @@ def parse_args():
                    help="start considering best-loss checkpoints at this 1-based step")
     p.add_argument("--best-min-delta", type=float, default=None,
                    help="minimum loss improvement required before overwriting ckpt_best.pt")
+    p.add_argument("--save-every-steps", type=int, default=None,
+                   help="save numbered full checkpoints every N steps; 0 disables")
+    p.add_argument("--save-final", type=int, default=None,
+                   help="1 saves ckpt_final.pt after normal training completion")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--device", type=str,
@@ -240,6 +244,10 @@ def main():
         trainer_cfg.best_checkpoint_start_step = int(args.best_start_step)
     if args.best_min_delta is not None:
         trainer_cfg.best_checkpoint_min_delta = float(args.best_min_delta)
+    if args.save_every_steps is not None:
+        trainer_cfg.save_every_steps = int(args.save_every_steps)
+    if args.save_final is not None:
+        trainer_cfg.save_final = bool(args.save_final)
     max_steps = int(trainer_cfg.get("max_steps", 100))
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
     log_interval = int(trainer_cfg.get("log_interval", 5))

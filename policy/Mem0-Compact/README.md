@@ -92,14 +92,20 @@ python source/training/train_compact.py \
 # Before server training, set execution_module.qwen_vl.model_path in the chosen
 # config YAML to the local Qwen3-VL-2B checkpoint (or allow Hugging Face access).
 
-# 3. single-A800 server run (direct Python; safe starting batch)
-CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+# 3. single-A800 server run (direct Python; temporally correct batch size)
+CUDA_VISIBLE_DEVICES=0 \
+  NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.01 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/compact_swap_blocks/ckpt_best.pt and ckpt_final.pt
 
 # M(n) tasks use the classifier-enabled config (λ_cls=0.2 + focal BCE):
 CONFIG=source/config/mem0_compact_train_mn.yaml \
-  CUDA_VISIBLE_DEVICES=0 NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  CUDA_VISIBLE_DEVICES=0 \
+  NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.01 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/compact_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
