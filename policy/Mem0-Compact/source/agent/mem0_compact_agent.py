@@ -133,6 +133,10 @@ class Mem0CompactAgent:
         checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
         checkpoint_path = ""
         if checkpoint_config is not None:
+            # Training saves the config via OmegaConf.to_container(), i.e. a
+            # plain dict; OmegaConf.select() requires an OmegaConf node.
+            if isinstance(checkpoint_config, dict):
+                checkpoint_config = OmegaConf.create(checkpoint_config)
             checkpoint_path = str(OmegaConf.select(
                 checkpoint_config, "execution_module.qwen_vl.model_path", default=""
             ) or "")
