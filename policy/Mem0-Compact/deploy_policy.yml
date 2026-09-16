@@ -26,7 +26,7 @@ vllm_url: http://localhost:8000
 execution_module:
   # Qwen VLM (loaded by CompactModeWrapper; flash-attn not required)
   qwen_vl:
-    model_path: Qwen/Qwen3-VL-2B-Instruct
+    model_path: /data2/songyuebing/JAMEL-DeltaState/LLMs/Qwen3-VL-2B-Instruct
     system_prompt: null
   # COMPACT per-layer side memory
   compact:

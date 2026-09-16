@@ -42,6 +42,9 @@ class Mem0CompactAgent:
     def __init__(self, cfg: OmegaConf, ckpt_path: str, device: torch.device):
         self.config = cfg
 
+        checkpoint_payload = self._load_checkpoint_payload(ckpt_path)
+        self._resolve_base_model_path(checkpoint_payload)
+
         task_name = self.config.get("task_name", "unknown_task")
         self.task_type = "M1" if task_name in M1_TASKS else "Mn"
         cprint(f"[Mem0-Compact] task name: {task_name}", "red")
@@ -70,7 +73,7 @@ class Mem0CompactAgent:
 
         self.executor = Mem0CompactExecutor(self.config, device=device).to(device)
         self.executor.eval()
-        self._load_ckpt(ckpt_path)
+        self._load_ckpt(ckpt_path, payload=checkpoint_payload)
 
         # COMPACT recurrent state — reset per episode (reset_model).
         self.memory = None
@@ -107,16 +110,78 @@ class Mem0CompactAgent:
         shutil.rmtree("./_tmp_visual/", ignore_errors=True)
         os.makedirs("./_tmp_visual/", exist_ok=True)
 
-    def _load_ckpt(self, ckpt_path: str):
+    @staticmethod
+    def _load_checkpoint_payload(ckpt_path: str):
         if not ckpt_path or not Path(ckpt_path).is_file():
             raise FileNotFoundError(f"execution ckpt not found: {ckpt_path}")
-        # mmap=True: don't materialize the full state dict in RAM — the 2B
-        # model + full ckpt together exceed small dev machines (15GB RAM).
         try:
-            payload = torch.load(ckpt_path, map_location="cpu",
-                                 weights_only=False, mmap=True)
+            return torch.load(ckpt_path, map_location="cpu",
+                              weights_only=False, mmap=True)
         except TypeError:  # older torch without mmap support
-            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    def _resolve_base_model_path(self, payload) -> None:
+        """Prefer an available local base model for offline evaluation.
+
+        Training checkpoints contain the resolved training config. This lets
+        evaluation recover a server-local base-model path even when the eval
+        YAML still contains the original Hugging Face model ID.
+        """
+        runtime_path = str(OmegaConf.select(
+            self.config, "execution_module.qwen_vl.model_path", default=""
+        ) or "")
+        checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
+        checkpoint_path = ""
+        if checkpoint_config is not None:
+            checkpoint_path = str(OmegaConf.select(
+                checkpoint_config, "execution_module.qwen_vl.model_path", default=""
+            ) or "")
+
+        candidates = []
+        for label, candidate in (("deployment", runtime_path),
+                                 ("checkpoint", checkpoint_path)):
+            if not candidate:
+                continue
+            candidate_path = Path(candidate).expanduser()
+            if candidate_path.is_dir() and (candidate_path / "config.json").is_file():
+                candidates.append((label, str(candidate_path)))
+
+        if candidates:
+            selected_label, selected_path = candidates[0]
+            if selected_path != runtime_path:
+                OmegaConf.update(
+                    self.config,
+                    "execution_module.qwen_vl.model_path",
+                    selected_path,
+                    merge=False,
+                )
+                cprint(
+                    f"[Mem0-Compact] using {selected_label} local base model: "
+                    f"{selected_path}",
+                    "cyan",
+                )
+            return
+
+        # Leave a valid HF ID untouched when online loading is possible. In
+        # offline mode, fail here with the actionable path/config message
+        # instead of the much less helpful transformers cache exception.
+        if runtime_path and not Path(runtime_path).expanduser().exists():
+            offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in {
+                "1", "true", "yes"
+            }
+            if offline:
+                raise FileNotFoundError(
+                    "No usable local Qwen base model was found for offline eval. "
+                    "Set execution_module.qwen_vl.model_path in deploy_policy.yml "
+                    "to a directory containing config.json and the model weights, "
+                    "or copy the training checkpoint's model_path onto this server. "
+                    f"Deployment path: {runtime_path!r}; "
+                    f"checkpoint path: {checkpoint_path!r}"
+                )
+
+    def _load_ckpt(self, ckpt_path: str, payload=None):
+        if payload is None:
+            payload = self._load_checkpoint_payload(ckpt_path)
         checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
         if checkpoint_config is None:
             raise ValueError(
