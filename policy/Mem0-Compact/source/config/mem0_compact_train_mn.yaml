@@ -9,6 +9,8 @@ wandb_project: Mem0-Compact
 is_debug: false
 
 execution_module:
+  variant: compact
+
   # Qwen VLM (loaded by CompactModeWrapper — bf16, sdpa attention; flash-attn
   # is NOT required and excluded per CompactMoDE env constraints)
   qwen_vl:

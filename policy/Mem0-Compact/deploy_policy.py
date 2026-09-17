@@ -197,13 +197,25 @@ def eval(TASK_ENV, model: Mem0CompactAgent, observation: dict):
         model.ffmpeg.stdin.write(TASK_ENV.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
     steps_to_run = min(model.action_strip, actions.shape[0])
+    executed_steps = 0
+    # Baseline M(1) has neither recurrent memory to advance nor a subtask
+    # classifier: intermediate update_obs calls only overwrite the cached
+    # summary, so all but the LAST observation's VLM forward are discarded
+    # work. Encode only the final observation of the chunk (the one the next
+    # action prediction actually conditions on). M(n) still needs per-step
+    # encoding for the classifier; compact needs it for memory updates.
+    lazy_obs = (model.variant == "baseline" and model.task_type == "M1")
     for idx in range(steps_to_run):
         action = actions[idx]
         TASK_ENV.take_action(action, action_type="qpos")
+        executed_steps += 1
 
         observation = TASK_ENV.get_obs()
         observation["instruction"] = instruction
         encoded_obs = encode_obs(observation)
+        env_succeeded = bool(getattr(TASK_ENV, "eval_success", False))
+        if lazy_obs and idx < steps_to_run - 1 and not env_succeeded:
+            continue
         sub_end_flag = model.update_obs(encoded_obs)
 
         # ── Mn: subtask-end gating (COMPACT memory NOT reset — idea.md §3) ──
@@ -214,9 +226,11 @@ def eval(TASK_ENV, model: Mem0CompactAgent, observation: dict):
                 image = TASK_ENV.now_obs["observation"]["head_camera"]["rgb"]
                 Image.fromarray(image).save(f"./_tmp_visual/image_{model.stage}.png")
                 break
+        if env_succeeded:
+            break
 
     # Advance iteration by number of executed steps
-    model.iter += steps_to_run
+    model.iter += executed_steps
 
     # ── Mn: subtask transition → planner for the next instruction ──
     if model.task_type == "Mn" and model.end_signal_count >= model.threshold:

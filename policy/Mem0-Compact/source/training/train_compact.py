@@ -48,6 +48,7 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 
@@ -68,9 +69,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from source.dataloader.dataset_min_max import LeRobot_Dataset
 from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
 from source.models.execution_module.mem0_compact_executor import Mem0CompactExecutor
+from source.models.execution_module.mem0_baseline_executor import Mem0BaselineExecutor
 from source.training.ddp_utils import (all_reduce_avg, destroy_distributed,
                                        get_ddp_device, is_rank0, rank0_print,
                                        setup_distributed)
+
+EXECUTOR_VARIANTS = {"compact": Mem0CompactExecutor, "baseline": Mem0BaselineExecutor}
 
 
 def collate_batch(samples: list) -> dict:
@@ -89,8 +93,16 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str,
                    default="source/config/mem0_compact_train.yaml")
+    p.add_argument("--variant", type=str, default=None,
+                   choices=["compact", "baseline"],
+                   help="executor variant (default: execution_module.variant in "
+                        "the config yaml); 'baseline' = VLM+DiT without the "
+                        "COMPACT side memory")
     p.add_argument("--task", type=str, default=None,
                    help="override vla_dataset repo task dir (uses lerobot_datasets/<task>)")
+    p.add_argument("--model-path", type=str, default=None,
+                   help="override execution_module.qwen_vl.model_path "
+                        "(e.g. Qwen/Qwen3-VL-2B-Instruct for HF-cache runs)")
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--window-size", type=int, default=None,
@@ -216,6 +228,15 @@ def synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def all_ranks_finite(value: torch.Tensor) -> bool:
+    """Return True only when ``value`` is finite on every DDP rank."""
+    finite_flag = torch.isfinite(value.detach()).all().to(
+        device=value.device, dtype=torch.int32)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+    return bool(finite_flag.item())
+
+
 def main():
     args = parse_args()
 
@@ -230,6 +251,18 @@ def main():
     if not cfg_path.is_absolute():
         cfg_path = PROJECT_ROOT / cfg_path
     cfg = OmegaConf.load(cfg_path)
+
+    # Executor variant: CLI > config yaml > "compact".
+    variant = args.variant or str(cfg.execution_module.get("variant", "compact"))
+    if variant not in EXECUTOR_VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; expected one of "
+                         f"{sorted(EXECUTOR_VARIANTS)}")
+    cfg.execution_module.variant = variant
+    cprint(f"[train] executor variant: {variant}", "cyan")
+
+    if args.model_path:
+        cfg.execution_module.qwen_vl.model_path = args.model_path
+        cprint(f"[train] qwen_vl.model_path overridden: {args.model_path}", "cyan")
 
     if args.freeze_base is not None:
         cfg.execution_module.compact.freeze_base = bool(args.freeze_base)
@@ -300,16 +333,23 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     # ── Model ──
-    rank0_print("[train] building executor (this loads Qwen3-VL-2B)...")
-    model = Mem0CompactExecutor(cfg, device=device).to(device)
+    rank0_print(f"[train] building {variant} executor (this loads Qwen3-VL-2B)...")
+    model = EXECUTOR_VARIANTS[variant](cfg, device=device).to(device)
     if ddp_enabled:
         gradient_checkpointing = bool(
             cfg.execution_module.compact.get("gradient_checkpointing", False)
         )
+        # COMPACT performs one backward over its recurrent window and needs
+        # static_graph with re-entrant checkpointing. The baseline instead
+        # performs multiple independent forward/backward passes under
+        # no_sync; PyTorch DDP cannot combine that pattern with static_graph.
+        baseline_incremental = variant == "baseline"
         model = DDP(model,
                     device_ids=[device.index] if device.type == "cuda" else None,
-                    find_unused_parameters=not gradient_checkpointing,
-                    static_graph=gradient_checkpointing)
+                    find_unused_parameters=(baseline_incremental
+                                            or not gradient_checkpointing),
+                    static_graph=(gradient_checkpointing
+                                  and not baseline_incremental))
     raw_model = model.module if ddp_enabled else model
     if is_rank0():
         counts = raw_model.trainable_param_counts()
@@ -374,10 +414,18 @@ def main():
                 f"batch={batch_size}x{world_size}, iters={total_iters}")
 
     step_times = []
+    # Baseline frames are independent (no recurrent memory), so retaining K
+    # graphs for one backward is pure waste: backward each frame immediately
+    # (gradients accumulate identically), using no_sync on non-last frames
+    # under DDP. COMPACT keeps the single per-window backward — its memory
+    # legitimately connects the K frames in one graph.
+    incremental_bwd = (variant == "baseline")
     for step in range(start_step, max_steps):
         t0 = time.time()
         profiling = args.profile_steps > 0 and (step - start_step) < args.profile_steps
-        profile_times = {"data": 0.0, "forward": 0.0}
+        profile_times = {"data": 0.0, "forward": 0.0, "backward": 0.0}
+        if incremental_bwd:
+            optimizer.zero_grad(set_to_none=True)
         window_loss = torch.zeros((), device=device, dtype=torch.float32)
         log_parts = {}
         for k in range(window_size):
@@ -405,24 +453,47 @@ def main():
             prev_episode = ep_ids.clone()
             batch["prev_action"] = prev_action
 
-            # Forward MUST go through the (DDP-wrapped) model — DDP.forward
-            # registers the gradient-sync hooks; bypassing it would silently
-            # skip gradient synchronization across ranks.
-            if profiling:
-                synchronize_device(device)
-                phase_start = time.perf_counter()
-            loss_dict, memory = model(batch, memory)
-            if profiling:
-                synchronize_device(device)
-                profile_times["forward"] += time.perf_counter() - phase_start
-            window_loss = window_loss + loss_dict["total"] / window_size
+            # DDP.no_sync() must include BOTH forward and backward. Wrapping
+            # backward alone does not disable gradient synchronization.
+            sync_context = (
+                model.no_sync()
+                if incremental_bwd and ddp_enabled and k < window_size - 1
+                else nullcontext()
+            )
+            with sync_context:
+                # Forward MUST go through the DDP wrapper so reducer hooks are
+                # installed for this frame.
+                if profiling:
+                    synchronize_device(device)
+                    phase_start = time.perf_counter()
+                loss_dict, memory = model(batch, memory)
+                if profiling:
+                    synchronize_device(device)
+                    profile_times["forward"] += time.perf_counter() - phase_start
+                if incremental_bwd:
+                    scaled = loss_dict["total"] / window_size
+                    if profiling:
+                        synchronize_device(device)
+                        phase_start = time.perf_counter()
+                    scaled.backward()
+                    if profiling:
+                        synchronize_device(device)
+                        profile_times["backward"] += (
+                            time.perf_counter() - phase_start
+                        )
+                    window_loss = window_loss + scaled.detach()
+                else:
+                    window_loss = window_loss + loss_dict["total"] / window_size
             if k == window_size - 1:
                 log_parts = {key: float(value.detach())
                              for key, value in loss_dict.items()
                              if isinstance(value, torch.Tensor)}
 
-        if not torch.isfinite(window_loss):
-            rank0_print(f"[train] step {step+1}: non-finite window loss, skipping")
+        if not all_ranks_finite(window_loss):
+            rank0_print(
+                f"[train] step {step+1}: non-finite window loss on at least "
+                "one rank, skipping on all ranks"
+            )
             optimizer.zero_grad(set_to_none=True)
             memory = raw_model.detach_memory(memory)
             continue
@@ -430,11 +501,22 @@ def main():
         if profiling:
             synchronize_device(device)
             phase_start = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        window_loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], grad_clip)
+        if not incremental_bwd:
+            optimizer.zero_grad(set_to_none=True)
+            window_loss.backward()
+        trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_parameters,
+            grad_clip if grad_clip > 0 else float("inf"),
+        )
+        if not all_ranks_finite(grad_norm):
+            rank0_print(
+                f"[train] step {step+1}: non-finite gradient norm on at least "
+                "one rank, skipping on all ranks"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            memory = raw_model.detach_memory(memory)
+            continue
         optimizer.step()
         scheduler.step()
         if profiling:
@@ -460,6 +542,7 @@ def main():
                 f"[profile] step {step+1}: "
                 f"data={profile_times['data']:.2f}s "
                 f"forward={profile_times['forward']:.2f}s "
+                f"backward={profile_times['backward']:.2f}s "
                 f"backward+optimizer={profile_times['backward_optimizer']:.2f}s"
             )
 

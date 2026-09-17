@@ -18,4 +18,5 @@ python script/eval_policy.py --config policy/${policy_name}/deploy_policy.yml --
     --execution_ckpt ./policy/Mem0-Compact/runs/compact/final.pt \
     --state_stats_path ./policy/Mem0-Compact/assets/swap_blocks/norm_stats.json \
     --global_task "There are three traies on the table, and two blocks are placed in two different traies. You may move only one block at a time, and each tray can hold at most one block. Swap the positions of the two blocks. Finally press the button." \
-    --action_horizon 30
+    --action_horizon 30 \
+    --action_execute_steps 1

@@ -219,7 +219,9 @@ python -m pip install \
 
 pip install setuptools==69.5.1
 
-python -m pip install ninja einops "h5py==3.16.0" diffusers
+python -m pip install ninja einops "h5py==3.16.0" diffusers rich
+
+pip install "flash-attn==2.6.1" --no-build-isolation
 
 python -m pip install --force-reinstall "setuptools<81"
 

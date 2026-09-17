@@ -109,6 +109,27 @@ CONFIG=source/config/mem0_compact_train_mn.yaml \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/compact_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
+# Baseline ablation (VLM+DiT, NO COMPACT memory — idea.md §2.5): same trainer,
+# same loop semantics, selected by the config's `execution_module.variant`.
+# OUTPUT_DIR is optional — the launcher derives runs/<variant>_<task> from the
+# config's variant field.
+CONFIG=source/config/mem0_baseline_train.yaml \
+  CUDA_VISIBLE_DEVICES=0 \
+  NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.01 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 \
+  EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
+# Outputs: runs/baseline_swap_blocks/ckpt_best.pt and ckpt_final.pt
+
+# M(n) baseline (classifier enabled):
+CONFIG=source/config/mem0_baseline_train_mn.yaml \
+  CUDA_VISIBLE_DEVICES=0 \
+  NPROC=1 TASK=cover_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.01 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 \
+  EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
+# Outputs: runs/baseline_cover_blocks/ckpt_best.pt and ckpt_final.pt
+
 # 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU; start at
 # 1 and scale only after confirming memory use. Global batch = BATCH_SIZE*NPROC.
 # Checkpoint policy:
@@ -159,7 +180,19 @@ python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --ov
     --execution_ckpt policy/Mem0-Compact/runs/compact_swap_blocks/ckpt_final.pt \
     --state_stats_path policy/Mem0-Compact/assets/swap_blocks/norm_stats.json \
     --device cuda:0 \
-    --action_horizon 30
+    --action_horizon 30 \
+    --action_execute_steps 1
+
+# Baseline variant: identical command, only the checkpoint changes — the agent
+# reads `variant` from the checkpoint's saved config (deploy_policy.yml's
+# execution_module.variant is just a fallback).
+python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --overrides \
+    --task_name swap_blocks --task_config demo_clean \
+    --execution_ckpt policy/Mem0-Compact/runs/baseline_swap_blocks/ckpt_final.pt \
+    --state_stats_path policy/Mem0-Compact/assets/swap_blocks/norm_stats.json \
+    --device cuda:0 \
+    --action_horizon 30 \
+    --action_execute_steps 1
 
 # M(n): classifier is auto-enabled by task name; planner runs via vLLM
 # (start it first: vllm serve <merged-8B> --port 8123 or set --vllm_url)
@@ -169,7 +202,8 @@ python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --ov
     --state_stats_path policy/Mem0-Compact/assets/cover_blocks/norm_stats.json \
     --vllm_url http://localhost:8123 \
     --device cuda:0 \
-    --action_horizon 30
+    --action_horizon 30 \
+    --action_execute_steps 1
 ```
 
 Deploy pipeline check without SAPIEN (both task types):
@@ -193,4 +227,7 @@ python debug/test_deploy.py --mn --device cpu                  # M(n) path
 | M(n) training run (cover_blocks, 2 episodes, λ_cls) | `source/training/train_compact.py --config ..._mn.yaml` | ✔ |
 | Deploy round-trip M(1) (get_model/eval/reset_model) | `debug/test_deploy.py` | ✔ |
 | Deploy round-trip M(n) (classifier + planner wiring) | `debug/test_deploy.py --mn` | ✔ |
+| Baseline: model builds + fwd/bwd + no-memory API | `debug/smoke_forward_baseline.py` | ✔ |
+| Baseline: short training run (swap_blocks, 20 steps) | `train_compact.py --config mem0_baseline_train.yaml` | ✔ |
+| Baseline: deploy round-trip M(1), variant from ckpt | `debug/test_deploy.py --ckpt runs/dev_baseline_swap_blocks/ckpt_final.pt` | ✔ |
 | SAPIEN sim eval | `script/eval_policy.py` | A800 server (dev RAM too small for sim + 2B VLM) |

@@ -1,7 +1,8 @@
-# Mem0-Compact execution-module training config (swap_blocks M1 first target).
-# Based on Mem-0's source/config/execution_module_train.yaml with the MemoryBank
-# removed and the COMPACT side-memory section added. See idea.md for the design
-# contract.
+# Mem0-Compact BASELINE training config for M(n) tasks (ablation: VLM+DiT,
+# NO COMPACT memory, WITH subtask-end classifier). Identical to
+# mem0_compact_train_mn.yaml except variant: baseline. The `compact` section is
+# kept ONLY for the VLM flags it shares (freeze_base / bf16 /
+# gradient_checkpointing) — memory params and lambda_* aux weights are ignored.
 
 seed: 42
 wandb_entity:
@@ -9,28 +10,25 @@ wandb_project: Mem0-Compact
 is_debug: false
 
 execution_module:
-  # Executor variant: "compact" (per-layer side memory) or "baseline"
-  # (VLM+DiT ablation without memory; use mem0_baseline_train.yaml instead).
-  variant: compact
+  variant: baseline
 
-  # Qwen VLM (loaded by CompactModeWrapper — bf16, sdpa attention; flash-attn
-  # is NOT required and excluded per CompactMoDE env constraints)
+  # Qwen VLM (plain HF forward — bf16, sdpa attention; flash-attn not required)
   qwen_vl:
-    model_path: /data2/songyuebing/JAMEL-DeltaState/LLMs/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
+    model_path: Qwen/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
     system_prompt: null
 
-  # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
+  # VLM flags only in the baseline (see header note); memory params ignored.
   compact:
-    mem_dim: 128
-    num_mem_tokens: 16
-    num_heads: 8
-    num_obs_tokens: 4
+    mem_dim: 128                # ignored (no side memory)
+    num_mem_tokens: 16          # ignored
+    num_heads: 8                # ignored
+    num_obs_tokens: 4           # ignored
     freeze_base: false          # opt-in via --freeze-base 1 / FREEZE_BASE=1
     bf16: true
     gradient_checkpointing: false
-    lambda_obs: 0.01
-    lambda_nll: 0.01
-    lambda_mem: 0.001
+    lambda_obs: 0.01            # ignored (no aux losses)
+    lambda_nll: 0.01            # ignored
+    lambda_mem: 0.001           # ignored
 
   # Flow-matching DiT action head (copied from Mem-0, unchanged)
   action_model:
@@ -57,9 +55,9 @@ execution_module:
       output_dim: 2048
       positional_embeddings: null
 
-  # Subtask End Classifier — input 2x2048=4096 (idea.md §2.3). DISABLED for
-  # M(1) tasks (idea.md §3.5); enable for M(n).
-  use_classifier: false
+  # Subtask End Classifier — input 2x2048=4096. REQUIRED for M(n) (drives the
+  # planner hand-off at eval); disabled only for M(1).
+  use_classifier: true
   classifier:
     hidden_sizes: [4096, 2048, 512]
     dropout: 0.1
@@ -67,18 +65,20 @@ execution_module:
     focal_gamma: 1.0
     threshold: 0.5
 
-  # Loss weights (idea.md §3): flow 1.0, cls 0.2 (Mn), aux in `compact` above
+  # Loss weights: flow 1.0, cls 0.2; no aux losses in the baseline
   loss_weights:
     lambda_action: 1.0
     lambda_classifier: 0.2
 
-# TBPTT training loop (idea.md §3)
+# TBPTT loop settings — kept IDENTICAL to the compact config so both variants
+# see the same number of optimizer steps and frames (incremental per-frame
+# backward in the baseline; no state is carried).
 tbptt:
-  window_size: 8          # K — frames per backward window
+  window_size: 8
   detach_at_boundary: true
 
 dataloader:
-  num_workers: 1          # keep at 1: temporal memory assumes batch-slot continuity
+  num_workers: 1
   shuffle_episodes: true
   seed: 42
   infinite: true
@@ -91,8 +91,8 @@ trainer:
   log_interval: 5
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
-  save_every_steps: 0     # optional fixed full checkpoints; 0 disables them
-  save_best: true         # overwrite one full checkpoint when train loss improves
+  save_every_steps: 0
+  save_best: true
   best_checkpoint_start_step: 1000
   best_checkpoint_min_delta: 0.0
   save_final: true
@@ -100,12 +100,12 @@ trainer:
   warmup_ratio: 0.05
   grad_clip_norm: 2.5
   weight_decay: 0.005
-  norm_stats_path: null   # e.g. assets/swap_blocks/norm_stats.json
+  norm_stats_path: null   # e.g. assets/cover_blocks/norm_stats.json
   learning_rate:
     qwen_model: 1.0e-5
     action_model: 1.0e-4
     classifier: 1.0e-4
-    memory: 5.0e-6        # side-memory modules only
+    memory: 5.0e-6        # ignored in the baseline (no memory params)
 
 vla_dataset:
   RMBench:
@@ -114,6 +114,7 @@ vla_dataset:
       - observation.state
       - action
       - subtask
+      - global_task
       - subtask_end
       - episode_id
       - observation.image.head_camera

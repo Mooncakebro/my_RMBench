@@ -33,6 +33,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from source.models.execution_module.mem0_compact_executor import Mem0CompactExecutor
+from source.models.execution_module.mem0_baseline_executor import Mem0BaselineExecutor
+
+EXECUTOR_VARIANTS = {"compact": Mem0CompactExecutor, "baseline": Mem0BaselineExecutor}
 
 M1_TASKS = ["swap_blocks", "swap_T", "observe_and_pickup",
             "put_back_block", "rearrange_blocks"]
@@ -64,14 +67,22 @@ class Mem0CompactAgent:
                 f"({nested_horizon})"
             )
         self.action_horizon = nested_horizon
-        self.action_strip = self.action_horizon
+        self.action_strip = int(self.config.get("action_execute_steps", 1))
+        if not 1 <= self.action_strip <= self.action_horizon:
+            raise ValueError(
+                "action_execute_steps must be between 1 and action_horizon; "
+                f"got {self.action_strip} and {self.action_horizon}"
+            )
         self.threshold = self.config.get("threshold", 2)
 
         self._last_summary: Optional[torch.Tensor] = None
         self._last_state: Optional[torch.Tensor] = None
         self._time_action_history: Dict[int, list] = {}
 
-        self.executor = Mem0CompactExecutor(self.config, device=device).to(device)
+        self.variant = self._resolve_variant(checkpoint_payload)
+        cprint(f"[Mem0-Compact] executor variant: {self.variant}", "red")
+        self.executor = EXECUTOR_VARIANTS[self.variant](
+            self.config, device=device).to(device)
         self.executor.eval()
         self._load_ckpt(ckpt_path, payload=checkpoint_payload)
 
@@ -119,6 +130,27 @@ class Mem0CompactAgent:
                               weights_only=False, mmap=True)
         except TypeError:  # older torch without mmap support
             return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    def _resolve_variant(self, payload) -> str:
+        """Executor variant: checkpoint config wins, then the deploy yml.
+
+        The architecture must match the checkpoint, so a baseline checkpoint
+        loads as baseline even if the yml still says compact (and vice versa).
+        """
+        ckpt_cfg = payload.get("config") if isinstance(payload, dict) else None
+        if isinstance(ckpt_cfg, dict):
+            em_cfg = ckpt_cfg.get("execution_module", {})
+            if isinstance(em_cfg, dict) and em_cfg.get("variant"):
+                variant = str(em_cfg["variant"])
+                if variant in EXECUTOR_VARIANTS:
+                    return variant
+        variant = str(OmegaConf.select(
+            self.config, "execution_module.variant", default="compact"))
+        if variant not in EXECUTOR_VARIANTS:
+            raise ValueError(
+                f"unknown executor variant {variant!r}; expected one of "
+                f"{sorted(EXECUTOR_VARIANTS)}")
+        return variant
 
     def _resolve_base_model_path(self, payload) -> None:
         """Prefer an available local base model for offline evaluation.
@@ -206,18 +238,22 @@ class Mem0CompactAgent:
                     return None
             return current
 
-        fields = (
-            ("execution_module.compact.mem_dim", int),
-            ("execution_module.compact.num_mem_tokens", int),
-            ("execution_module.compact.num_heads", int),
-            ("execution_module.compact.num_obs_tokens", int),
+        fields = [
             ("execution_module.action_model.action_model_type", str),
             ("execution_module.action_model.action_dim", int),
             ("execution_module.action_model.state_dim", int),
             ("execution_module.action_model.action_horizon", int),
             ("execution_module.action_model.num_inference_timesteps", int),
             ("execution_module.use_classifier", bool),
-        )
+        ]
+        if self.variant == "compact":
+            fields += [
+                ("execution_module.compact.mem_dim", int),
+                ("execution_module.compact.num_mem_tokens", int),
+                ("execution_module.compact.num_heads", int),
+                ("execution_module.compact.num_obs_tokens", int),
+            ]
+        fields = tuple(fields)
         mismatches = []
         for path, cast in fields:
             expected = config_value(self.config, path)

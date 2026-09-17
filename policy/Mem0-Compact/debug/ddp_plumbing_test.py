@@ -17,6 +17,7 @@ world_size=1 (torchrun --nproc_per_node=1 source/training/train_compact.py ...).
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -31,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from source.training.ddp_utils import (all_reduce_avg, destroy_distributed,
                                        get_ddp_device, is_rank0, rank0_print,
                                        setup_distributed)
+from source.training.train_compact import all_ranks_finite
 
 
 class TinyExecutor(nn.Module):
@@ -70,6 +72,18 @@ class TinyExecutor(nn.Module):
         }
         new_memory = {"m": [m_new], "p": memory["p"], "e": [None]}
         return loss_dict, new_memory
+
+
+class TinyBaselineExecutor(nn.Module):
+    """Independent-frame executor for the baseline accumulation path."""
+
+    def __init__(self, hidden: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(),
+                                 nn.Linear(hidden, 1))
+
+    def forward(self, x: torch.Tensor):
+        return self.net(x).mean()
 
 
 def main():
@@ -112,6 +126,39 @@ def main():
         assert torch.allclose(rank0, gathered[r], atol=1e-6), \
             f"rank {r} grads diverged (DDP sync broken)"
     rank0_print("[ddp-test] gradient sync across ranks verified ✔")
+
+    # ── Baseline incremental backward + no_sync around forward/backward ──
+    baseline_raw = TinyBaselineExecutor().to(device)
+    baseline = DDP(
+        baseline_raw,
+        device_ids=[device.index] if device.type == "cuda" else None,
+        find_unused_parameters=True,
+        static_graph=False,
+    )
+    baseline.zero_grad(set_to_none=True)
+    frames = 4
+    baseline_loss = torch.zeros((), device=device)
+    for frame in range(frames):
+        sync_context = baseline.no_sync() if frame < frames - 1 else nullcontext()
+        with sync_context:
+            frame_loss = baseline(torch.randn(B, 32, device=device)) / frames
+            frame_loss.backward()
+        baseline_loss += frame_loss.detach()
+
+    baseline_grad = baseline_raw.net[0].weight.grad.detach().clone()
+    gathered = [torch.zeros_like(baseline_grad) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, baseline_grad)
+    for r in range(1, world_size):
+        assert torch.allclose(gathered[0], gathered[r], atol=1e-6), \
+            f"rank {r} baseline grads diverged"
+    rank0_print("[ddp-test] baseline incremental no_sync path verified ✔")
+
+    # Every rank must agree to skip when any one rank sees a non-finite value.
+    finite_probe = torch.tensor(
+        float("inf") if rank == world_size - 1 else 1.0, device=device)
+    assert not all_ranks_finite(finite_probe)
+    assert all_ranks_finite(torch.ones((), device=device))
+    rank0_print("[ddp-test] cross-rank finite consensus verified ✔")
 
     destroy_distributed()
     rank0_print("[ddp-test] ALL CHECKS PASSED ✔")

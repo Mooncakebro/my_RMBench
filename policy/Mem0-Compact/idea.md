@@ -90,6 +90,43 @@ Implementation must follow it exactly; deviations require explicit approval.
 - Per-module LRs follow Mem-0's scheme (qwen 1e-5, heads 1e-4); side-memory
   params get the CompactMoDE memory LR (5e-6) as a separate param group.
 
+### 2.5 Baseline variant (ablation, owner-requested)
+
+A **baseline executor** (`mem0_baseline_executor.py`, config
+`mem0_baseline_train.yaml`, selected via `execution_module.variant: baseline`
+or `--variant baseline`) measures the COMPACT memory's contribution:
+- **Identical in everything except memory**: same Qwen3-VL-2B backbone and
+  load kwargs, same chat-template tokenization, same masked-mean pooling →
+  2×2048 summary, same flow-matching DiT head, same classifier (Mn), same
+  min-max normalization, same loss weights (flow 1.0, cls 0.2), same LRs,
+  same TBPTT loop/dataloader/window K/max steps — both variants see the same
+  number of optimizer steps and frames.
+- The VLM runs **one plain HF forward per frame**; pooling reads
+  `hidden_states[-1]` (final layer, post-norm — the same pooling point as the
+  compact variant's post-injection + final-norm).
+- No side memory, no `prev_action_mlp`, no aux losses. The memory API is a
+  no-op (`init_memory`/`detach_memory`/`reset_memory_rows` return `{}`), so
+  the SAME training loop and deployment agent drive both variants.
+- **Training (post-audit refinement):** because baseline frames are
+  independent, the trainer backward-passes each frame immediately inside the
+  window (`no_sync` on non-last frames under DDP) instead of retaining K
+  graphs for one backward — mathematically identical gradient accumulation,
+  ~K× less activation memory. COMPACT keeps the single per-window backward
+  (its memory legitimately connects the K frames).
+- **Eval (post-audit refinement):** for the M(1) baseline, `deploy_policy.eval`
+  encodes only the LAST observation of each executed chunk — intermediate
+  summaries are discarded work since there is no memory to advance and no
+  classifier to run. M(n) keeps per-step encoding (classifier), compact keeps
+  it (memory updates).
+- Deployment: the agent resolves the variant from the **checkpoint's saved
+  config** (deploy yml `execution_module.variant` is only a fallback), so a
+  baseline checkpoint always loads as baseline. Eval command is identical —
+  only `--execution_ckpt` changes.
+- Configs: `mem0_baseline_train.yaml` (M1, no classifier) and
+  `mem0_baseline_train_mn.yaml` (Mn, classifier enabled). The training
+  launcher's default output dir is `runs/<variant>_<task>`, read from the
+  config's `variant` field, so baseline runs cannot clobber compact runs.
+
 ## 3. Training loop (TBPTT)
 
 - **Per-task training.** One model per task, matching Mem-0's stated scheme

@@ -75,6 +75,9 @@ def main():
                         "(Mn-path check; planner built offline, never called)")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--model-path", type=str, default=None,
+                   help="override execution_module.qwen_vl.model_path "
+                        "(e.g. Qwen/Qwen3-VL-2B-Instruct for HF-cache runs)")
     p.add_argument("--n-calls", type=int, default=2)
     args = p.parse_args()
 
@@ -86,6 +89,8 @@ def main():
     cfg.execution_ckpt = str(PROJECT_ROOT / args.ckpt)
     cfg.state_stats_path = str(PROJECT_ROOT / args.stats)
     cfg.task_name = args.task_name
+    if args.model_path:
+        cfg.execution_module.qwen_vl.model_path = args.model_path
     is_mn = args.task_name not in ("swap_blocks", "swap_T",
                                    "observe_and_pickup", "put_back_block",
                                    "rearrange_blocks")
@@ -178,6 +183,12 @@ def main():
     usr_args["device"] = args.device
     usr_args["execution_ckpt"] = cfg.execution_ckpt
     usr_args["state_stats_path"] = cfg.state_stats_path
+    if args.model_path:
+        usr_args.setdefault("execution_module", {})
+        usr_args["execution_module"] = dict(usr_args["execution_module"])
+        usr_args["execution_module"]["qwen_vl"] = dict(
+            usr_args["execution_module"].get("qwen_vl", {}))
+        usr_args["execution_module"]["qwen_vl"]["model_path"] = args.model_path
     model = deploy.get_model(usr_args)
 
     class FakeTaskEnv:

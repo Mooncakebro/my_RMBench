@@ -12,6 +12,9 @@
 #   MAX_STEPS    TBPTT windows (default 30000)
 #   FREEZE_BASE  1 to freeze the Qwen base (debug only)
 #   CONFIG       config yaml (default source/config/mem0_compact_train.yaml)
+#   VARIANT      executor variant for the default output dir (default: read
+#                from CONFIG's execution_module.variant; runs/${VARIANT}_${TASK})
+#   OUTPUT_DIR   explicit output dir (overrides the variant-based default)
 #   SAVE_BEST    1 to overwrite ckpt_best.pt on improved loss (default 1)
 #   BEST_START_STEP first step eligible for ckpt_best.pt (default 1000)
 #   BEST_MIN_DELTA minimum loss improvement for a best save (default 0.01)
@@ -28,7 +31,12 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 MAX_STEPS=${MAX_STEPS:-30000}
 FREEZE_BASE=${FREEZE_BASE:-0}
 CONFIG=${CONFIG:-source/config/mem0_compact_train.yaml}
-OUTPUT_DIR=${OUTPUT_DIR:-runs/compact_${TASK}}
+# Variant-aware default output dir: read execution_module.variant from the
+# config so a baseline run never clobbers runs/compact_<task>. VARIANT can be
+# set explicitly to override detection.
+VARIANT=${VARIANT:-$(grep -m1 -Po '^\s*variant:\s*\K[A-Za-z0-9_-]+' "$CONFIG" 2>/dev/null || true)}
+VARIANT=${VARIANT:-compact}
+OUTPUT_DIR=${OUTPUT_DIR:-runs/${VARIANT}_${TASK}}
 SAVE_BEST=${SAVE_BEST:-1}
 BEST_START_STEP=${BEST_START_STEP:-1000}
 BEST_MIN_DELTA=${BEST_MIN_DELTA:-0.01}
