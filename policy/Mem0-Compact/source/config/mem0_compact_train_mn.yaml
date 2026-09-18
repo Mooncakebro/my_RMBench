@@ -90,7 +90,7 @@ trainer:
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
   save_every_steps: 0     # optional fixed full checkpoints; 0 disables them
-  save_best: true         # overwrite one full checkpoint when train loss improves
+  save_best: true         # overwrite ckpt_best.pt on validation action loss
   best_checkpoint_start_step: 1000
   best_checkpoint_min_delta: 0.0
   save_final: true
@@ -104,6 +104,13 @@ trainer:
     action_model: 1.0e-4
     classifier: 1.0e-4
     memory: 5.0e-6        # side-memory modules only
+
+validation:
+  enabled: true
+  fraction: 0.1
+  interval_steps: 1000
+  seed: 100045
+  max_episodes: 0         # 0 = use the complete validation split
 
 vla_dataset:
   RMBench:

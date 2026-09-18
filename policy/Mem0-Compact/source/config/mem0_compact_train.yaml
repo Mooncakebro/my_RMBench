@@ -16,7 +16,7 @@ execution_module:
   # Qwen VLM (loaded by CompactModeWrapper — bf16, sdpa attention; flash-attn
   # is NOT required and excluded per CompactMoDE env constraints)
   qwen_vl:
-    model_path: /data2/songyuebing/JAMEL-DeltaState/LLMs/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
+    model_path: /mnt/lvm_storage/songyuebing/LLMs/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
     system_prompt: null
 
   # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
@@ -92,7 +92,7 @@ trainer:
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>
   save_every_steps: 0     # optional fixed full checkpoints; 0 disables them
-  save_best: true         # overwrite one full checkpoint when train loss improves
+  save_best: true         # overwrite ckpt_best.pt on validation action loss
   best_checkpoint_start_step: 1000
   best_checkpoint_min_delta: 0.0
   save_final: true
@@ -106,6 +106,13 @@ trainer:
     action_model: 1.0e-4
     classifier: 1.0e-4
     memory: 5.0e-6        # side-memory modules only
+
+validation:
+  enabled: true
+  fraction: 0.1
+  interval_steps: 1000
+  seed: 100045
+  max_episodes: 0         # 0 = use the complete validation split
 
 vla_dataset:
   RMBench:

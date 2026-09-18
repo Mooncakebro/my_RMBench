@@ -227,6 +227,9 @@ class FlowmatchingActionHead(nn.Module):
         self.action_dim = config.action_dim
         # self.action_horizon = config.future_action_window_size + 1
         self.action_horizon = config.action_horizon
+        self.repeated_diffusion_steps = max(
+            1, int(getattr(config, "repeated_diffusion_steps", 1))
+        )
         
         self.num_inference_timesteps = config.num_inference_timesteps
 
@@ -268,6 +271,16 @@ class FlowmatchingActionHead(nn.Module):
         actions: shape (B, future_action_window_size, D_action)
         """
         device = vl_embs.device
+
+        # Draw multiple independent flow-matching noise/time pairs for the
+        # same observation. This matches the original Mem-0 training recipe
+        # without repeating the expensive VLM forward pass in the executor.
+        repeats = self.repeated_diffusion_steps
+        if repeats > 1:
+            vl_embs = vl_embs.repeat(repeats, 1, 1)
+            actions = actions.repeat(repeats, 1, 1)
+            if state is not None:
+                state = state.repeat(repeats, 1, 1)
 
         # Embed noised action trajectory.
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)

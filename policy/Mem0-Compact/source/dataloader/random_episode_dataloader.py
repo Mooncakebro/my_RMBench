@@ -78,6 +78,8 @@ class RandomEpisodeIterableDataset(IterableDataset):
         shuffle: bool = True,
         seed: Optional[int] = None,
         infinite: bool = True,
+        episode_ids: Optional[List[int]] = None,
+        episode_to_indices: Optional[Dict[int, List[int]]] = None,
     ):
         """
         Initialize RandomEpisodeIterableDataset.
@@ -96,9 +98,19 @@ class RandomEpisodeIterableDataset(IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.infinite = infinite
+        self.requested_episode_ids = (
+            set(int(episode_id) for episode_id in episode_ids)
+            if episode_ids is not None else None
+        )
         
         # Build episode to frame indices mapping
-        self._build_episode_mapping()
+        if episode_to_indices is None:
+            self._build_episode_mapping()
+        else:
+            self.episode_to_indices = {
+                int(episode_id): list(indices)
+                for episode_id, indices in episode_to_indices.items()
+            }
         
         # Assign episodes to this rank
         self._assign_rank_episodes()
@@ -285,6 +297,11 @@ class RandomEpisodeIterableDataset(IterableDataset):
         Assign episodes to this rank based on episode_id % world_size == rank.
         """
         all_episode_ids = sorted(self.episode_to_indices.keys())
+        if self.requested_episode_ids is not None:
+            all_episode_ids = [
+                episode_id for episode_id in all_episode_ids
+                if episode_id in self.requested_episode_ids
+            ]
         self.rank_episodes = [eid for eid in all_episode_ids if eid % self.world_size == self.rank]
         
         if self.rank == 0:
@@ -417,4 +434,3 @@ class RandomEpisodeIterableDataset(IterableDataset):
                     )
         
         return _gen()
-

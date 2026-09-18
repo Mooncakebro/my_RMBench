@@ -134,12 +134,19 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
 # 1 and scale only after confirming memory use. Global batch = BATCH_SIZE*NPROC.
 # Checkpoint policy:
 #   - after step 1000, save_best=true overwrites ckpt_best.pt whenever the
-#     all-reduced TBPTT window loss reaches a new minimum
+#     fixed-seed, episode-disjoint validation action loss reaches a new minimum
 #   - ckpt_final.pt is saved at normal training completion
 #   - save_every_steps=0 disables additional numbered full checkpoints
 #   - best_checkpoint_min_delta can reduce noisy/repeated best saves
-#   - this is training-loss selection; no validation loop is implemented yet
+#   - validation uses 10% held-out episodes, no color jitter, and action loss
+#     only (not COMPACT auxiliary losses); change `validation:` in the config
+#     to control fraction/interval/seed, or set enabled=false to fall back to
+#     training-loss selection
 #   - both files are full resume checkpoints (model + optimizer + scheduler)
+#
+# The action head now honors action_model.repeated_diffusion_steps=8. It repeats
+# only DiT inputs/targets (not the expensive Qwen forward), matching Mem-0's
+# eight independent diffusion noise/time draws per observation.
 #
 # DDP notes:
 #   - NPROC=1 uses direct Python; NPROC>1 uses torchrun, one rank per GPU

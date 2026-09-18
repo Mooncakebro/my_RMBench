@@ -63,6 +63,7 @@ class LeRobot_Selective_Dataset(LeRobotDataset):
         fps: int = 30,
         action_horizon: int = 30,
         video_backend: str = "pyav",
+        image_augment: bool = True,
         **kwargs
     ):
         """
@@ -95,10 +96,17 @@ class LeRobot_Selective_Dataset(LeRobotDataset):
         
         # setup image transforms
         if image_scale is not None:
-            self.image_transforms = v2.Compose([
-                v2.Resize(image_scale),
-                v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.0),
-            ])
+            transforms = [v2.Resize(image_scale)]
+            if image_augment:
+                transforms.append(
+                    v2.ColorJitter(
+                        brightness=0.1,
+                        contrast=0.1,
+                        saturation=0.1,
+                        hue=0.0,
+                    )
+                )
+            self.image_transforms = v2.Compose(transforms)
         else:
             self.image_transforms = None
         
@@ -290,6 +298,7 @@ class LeRobot_Dataset(Dataset):
         action_horizon: int = 30,
         video_backend: str = "pyav",
         norm_stats_path: Optional[str] = None,
+        image_augment: bool = True,
         **kwargs
     ):
         self.dataset = LeRobot_Selective_Dataset(
@@ -299,6 +308,7 @@ class LeRobot_Dataset(Dataset):
             fps=fps,
             action_horizon=action_horizon,
             video_backend=video_backend,
+            image_augment=image_augment,
             **kwargs
         )
         

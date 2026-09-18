@@ -15,9 +15,9 @@
 #   VARIANT      executor variant for the default output dir (default: read
 #                from CONFIG's execution_module.variant; runs/${VARIANT}_${TASK})
 #   OUTPUT_DIR   explicit output dir (overrides the variant-based default)
-#   SAVE_BEST    1 to overwrite ckpt_best.pt on improved loss (default 1)
+#   SAVE_BEST    1 to overwrite ckpt_best.pt on improved validation action loss
 #   BEST_START_STEP first step eligible for ckpt_best.pt (default 1000)
-#   BEST_MIN_DELTA minimum loss improvement for a best save (default 0.01)
+#   BEST_MIN_DELTA minimum validation-loss improvement for a best save (default 0.01)
 #   SAVE_EVERY_STEPS numbered checkpoint interval; 0 disables (default 0)
 #   SAVE_FINAL   1 to save ckpt_final.pt on normal completion (default 1)
 #   EXTRA_ARGS   extra train_compact.py flags, e.g. "--grad-ckpt 1"

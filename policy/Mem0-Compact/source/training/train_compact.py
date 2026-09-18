@@ -46,11 +46,12 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -117,7 +118,7 @@ def parse_args():
     p.add_argument("--profile-steps", type=int, default=0,
                    help="print data/forward/backward timing for the first N steps")
     p.add_argument("--save-best", type=int, default=None,
-                   help="1 saves ckpt_best.pt using the all-reduced training loss")
+                   help="1 saves ckpt_best.pt using validation action loss when validation is enabled")
     p.add_argument("--best-start-step", type=int, default=None,
                    help="start considering best-loss checkpoints at this 1-based step")
     p.add_argument("--best-min-delta", type=float, default=None,
@@ -145,7 +146,12 @@ def make_lr_lambda(total_steps: int, warmup_ratio: float):
 
 
 def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
-                     batch_size: int = None, num_workers: int = None):
+                     batch_size: int = None, num_workers: int = None,
+                     base_dataset=None, episode_ids: Optional[Sequence[int]] = None,
+                     shuffle: Optional[bool] = None,
+                     infinite: Optional[bool] = None,
+                     episode_to_indices=None,
+                     image_augment: bool = True):
     trainer_cfg = cfg.get("trainer", {})
     batch_size = batch_size or int(trainer_cfg.get("batch_size", 8))
     num_workers = num_workers if num_workers is not None else int(
@@ -170,19 +176,27 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         "episode_id", "observation.image.head_camera",
     ])
     norm_stats_path = trainer_cfg.get("norm_stats_path", None)
-    base_dataset = LeRobot_Dataset(
-        repo_id=repo_id,
-        root=root,
-        features_to_load=list(features_to_load),
-        action_horizon=action_horizon,
-        norm_stats_path=norm_stats_path,
-    )
+    if base_dataset is None:
+        base_dataset = LeRobot_Dataset(
+            repo_id=repo_id,
+            root=root,
+            features_to_load=list(features_to_load),
+            action_horizon=action_horizon,
+            norm_stats_path=norm_stats_path,
+            image_augment=image_augment,
+        )
+    if shuffle is None:
+        shuffle = bool(cfg.get("dataloader", {}).get("shuffle_episodes", True))
+    if infinite is None:
+        infinite = bool(cfg.get("dataloader", {}).get("infinite", True))
     iterable = RandomEpisodeIterableDataset(
         base_dataset=base_dataset,
         rank=rank, world_size=world_size,
-        shuffle=bool(cfg.get("dataloader", {}).get("shuffle_episodes", True)),
+        shuffle=shuffle,
         seed=int(cfg.get("dataloader", {}).get("seed", cfg.get("seed", 42))) + rank,
-        infinite=bool(cfg.get("dataloader", {}).get("infinite", True)),
+        infinite=infinite,
+        episode_ids=list(episode_ids) if episode_ids is not None else None,
+        episode_to_indices=episode_to_indices,
     )
     loader_kwargs = {
         "batch_size": batch_size,
@@ -200,7 +214,9 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg,
                     best_loss: Optional[float] = None,
-                    best_step: Optional[int] = None) -> None:
+                    best_step: Optional[int] = None,
+                    best_val_action_loss: Optional[float] = None,
+                    best_val_step: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "model": model.state_dict(),
@@ -213,6 +229,10 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg,
         checkpoint["best_loss"] = float(best_loss)
     if best_step is not None:
         checkpoint["best_step"] = int(best_step)
+    if best_val_action_loss is not None:
+        checkpoint["best_val_action_loss"] = float(best_val_action_loss)
+    if best_val_step is not None:
+        checkpoint["best_val_step"] = int(best_val_step)
 
     temporary_path = path.with_name(f".{path.name}.tmp")
     try:
@@ -235,6 +255,85 @@ def all_ranks_finite(value: torch.Tensor) -> bool:
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
     return bool(finite_flag.item())
+
+
+def split_episode_ids(episode_ids: Sequence[int], validation_fraction: float,
+                      split_seed: int, max_validation_episodes: int = 0):
+    """Return deterministic, episode-disjoint train and validation IDs."""
+    all_ids = sorted(int(episode_id) for episode_id in episode_ids)
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation.fraction must be strictly between 0 and 1")
+    if len(all_ids) < 2:
+        raise ValueError("episode-level validation requires at least two episodes")
+
+    val_count = max(1, int(round(len(all_ids) * validation_fraction)))
+    val_count = min(val_count, len(all_ids) - 1)
+    shuffled = all_ids.copy()
+    random.Random(split_seed).shuffle(shuffled)
+    validation_ids = shuffled[:val_count]
+    if max_validation_episodes > 0:
+        validation_ids = validation_ids[:max_validation_episodes]
+    validation_ids = sorted(validation_ids)
+    validation_set = set(validation_ids)
+    training_ids = [episode_id for episode_id in all_ids
+                    if episode_id not in validation_set]
+    return training_ids, validation_ids
+
+
+@torch.inference_mode()
+def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
+                         validation_seed: int) -> float:
+    """Evaluate deterministic action loss over a finite episode-disjoint split.
+
+    The action head still performs its configured repeated diffusion draws. RNG
+    state is restored afterwards, so validation cannot change subsequent train
+    sampling. Auxiliary COMPACT losses are deliberately excluded from this
+    metric because checkpoints should be selected for action prediction.
+    """
+    was_training = raw_model.training
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        fixed_seed = int(validation_seed) + rank
+        torch.manual_seed(fixed_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(fixed_seed)
+
+        raw_model.eval()
+        memory = raw_model.init_memory(1, device)
+        previous_episode = torch.full((1,), -1, dtype=torch.long, device=device)
+        action_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        frame_count = torch.zeros((), dtype=torch.float64, device=device)
+
+        for batch in loader:
+            if batch["action"].shape[0] != 1:
+                raise ValueError("validation loader must use batch_size=1")
+            episode_id = batch["episode_id"].to(device)
+            reset_mask = [
+                previous_episode[0] < 0 or previous_episode[0] != episode_id[0]
+            ]
+            memory = raw_model.reset_memory_rows(memory, reset_mask, device)
+            previous_action = batch["state"].squeeze(1).to(device).clone()
+            if reset_mask[0]:
+                previous_action[0] = 0.0
+            previous_episode = episode_id.clone()
+            batch["prev_action"] = previous_action
+
+            loss_dict, memory = raw_model(batch, memory)
+            action_loss_sum += loss_dict["action"].detach().double()
+            frame_count += 1.0
+
+        stats = torch.stack([action_loss_sum, frame_count])
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        if stats[1].item() <= 0:
+            raise RuntimeError("validation split yielded no frames across all ranks")
+        return float((stats[0] / stats[1]).item())
+    finally:
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        raw_model.train(was_training)
 
 
 def main():
@@ -292,6 +391,12 @@ def main():
     best_min_delta = max(
         0.0, float(trainer_cfg.get("best_checkpoint_min_delta", 0.0))
     )
+    validation_cfg = cfg.get("validation", {})
+    validation_enabled = bool(validation_cfg.get("enabled", False))
+    validation_interval = max(1, int(validation_cfg.get("interval_steps", 1000)))
+    validation_fraction = float(validation_cfg.get("fraction", 0.1))
+    validation_seed = int(validation_cfg.get("seed", 100003))
+    validation_max_episodes = int(validation_cfg.get("max_episodes", 0))
 
     # TBPTT window
     tbptt_cfg = cfg.get("tbptt", {})
@@ -326,6 +431,8 @@ def main():
     )
 
     seed = int(cfg.get("seed", 42))
+    if "seed" not in validation_cfg:
+        validation_seed = seed + 100003
     torch.manual_seed(seed + rank)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed + rank)
@@ -368,6 +475,8 @@ def main():
     start_step = 0
     best_loss = float("inf")
     best_step = None
+    best_val_action_loss = float("inf")
+    best_val_step = None
     configured_resume = args.resume or trainer_cfg.get("resume")
     resume_path = Path(configured_resume).expanduser() if configured_resume else None
     if resume_path is not None:
@@ -396,12 +505,57 @@ def main():
         checkpoint_best_step = ckpt.get("best_step")
         if checkpoint_best_step is not None:
             best_step = int(checkpoint_best_step)
+        checkpoint_best_val_loss = ckpt.get("best_val_action_loss")
+        if checkpoint_best_val_loss is not None:
+            checkpoint_best_val_loss = float(checkpoint_best_val_loss)
+            if math.isfinite(checkpoint_best_val_loss):
+                best_val_action_loss = checkpoint_best_val_loss
+        checkpoint_best_val_step = ckpt.get("best_val_step")
+        if checkpoint_best_val_step is not None:
+            best_val_step = int(checkpoint_best_val_step)
         del ckpt
         rank0_print(f"[train] resumed from {resume_path} at step {start_step}")
 
-    # ── Data (episodes sharded per rank; global batch = batch * world_size) ──
-    loader = build_dataloader(cfg, args.task, rank=rank, world_size=world_size,
-                              batch_size=batch_size, num_workers=args.num_workers)
+    # ── Data (episode-disjoint train/validation split) ──
+    # Build one finite, deterministic probe loader to obtain the authoritative
+    # episode-to-frame mapping. The same underlying dataset is reused for both
+    # loaders so validation sees exactly the same normalization/layout.
+    probe_loader = build_dataloader(
+        cfg, args.task, rank=rank, world_size=world_size, batch_size=1,
+        num_workers=0, shuffle=False, infinite=False, image_augment=False)
+    probe_iterable = probe_loader.dataset
+    all_episode_ids = sorted(probe_iterable.episode_to_indices.keys())
+    if validation_enabled:
+        train_episode_ids, validation_episode_ids = split_episode_ids(
+            all_episode_ids, validation_fraction, validation_seed,
+            validation_max_episodes)
+    else:
+        train_episode_ids, validation_episode_ids = all_episode_ids, []
+    if not train_episode_ids:
+        raise ValueError("episode split left no training episodes")
+    if validation_enabled and not validation_episode_ids:
+        raise ValueError("validation split contains no episodes")
+
+    loader = build_dataloader(
+        cfg, args.task, rank=rank, world_size=world_size,
+        batch_size=batch_size, num_workers=args.num_workers,
+        episode_ids=train_episode_ids,
+        episode_to_indices=probe_iterable.episode_to_indices,
+        shuffle=True, infinite=True, image_augment=True)
+    validation_loader = None
+    if validation_enabled:
+        validation_loader = build_dataloader(
+            cfg, args.task, rank=rank, world_size=world_size,
+            batch_size=1, num_workers=0, base_dataset=probe_iterable.base_dataset,
+            episode_ids=validation_episode_ids,
+            episode_to_indices=probe_iterable.episode_to_indices,
+            shuffle=False, infinite=False, image_augment=False)
+    if is_rank0():
+        rank0_print(
+            f"[data] episodes: train={len(train_episode_ids)} "
+            f"validation={len(validation_episode_ids)} "
+            f"(fraction={validation_fraction:g})"
+        )
     data_iter = iter(loader)
 
     # ── TBPTT state (per-rank, no cross-rank coupling) ──
@@ -547,8 +701,51 @@ def main():
             )
 
         current_loss = float(window_loss.detach().item())
-        if (
-            save_best
+        should_validate = (
+            validation_enabled
+            and ((step + 1) % validation_interval == 0 or step + 1 == max_steps)
+        )
+        if should_validate:
+            val_action_loss = validate_action_loss(
+                raw_model,
+                validation_loader,
+                device,
+                rank,
+                validation_seed,
+            )
+            rank0_print(
+                f"[val] step {step+1}/{max_steps} "
+                f"action_loss {val_action_loss:.6f} "
+                f"episodes={len(validation_episode_ids)}"
+            )
+            if (
+                save_best
+                and is_rank0()
+                and (step + 1) >= best_start_step
+                and val_action_loss < best_val_action_loss - best_min_delta
+            ):
+                best_val_action_loss = val_action_loss
+                best_val_step = step + 1
+                save_checkpoint(
+                    output_dir / "ckpt_best.pt",
+                    raw_model,
+                    optimizer,
+                    scheduler,
+                    step + 1,
+                    cfg,
+                    best_loss=(best_loss if math.isfinite(best_loss) else None),
+                    best_step=best_step,
+                    best_val_action_loss=best_val_action_loss,
+                    best_val_step=best_val_step,
+                )
+                rank0_print(
+                    f"[val] new best action loss {best_val_action_loss:.6f} "
+                    f"at step {best_val_step}; saved "
+                    f"{output_dir / 'ckpt_best.pt'}"
+                )
+        elif (
+            not validation_enabled
+            and save_best
             and is_rank0()
             and (step + 1) >= best_start_step
             and current_loss < best_loss - best_min_delta
@@ -575,14 +772,22 @@ def main():
                             raw_model, optimizer, scheduler, step + 1, cfg,
                             best_loss=(best_loss if math.isfinite(best_loss)
                                        else None),
-                            best_step=best_step)
+                            best_step=best_step,
+                            best_val_action_loss=(
+                                best_val_action_loss
+                                if math.isfinite(best_val_action_loss) else None),
+                            best_val_step=best_val_step)
 
     if is_rank0() and bool(trainer_cfg.get("save_final", True)):
         save_checkpoint(output_dir / "ckpt_final.pt", raw_model, optimizer,
                         scheduler, max_steps, cfg,
                         best_loss=(best_loss if math.isfinite(best_loss)
                                    else None),
-                        best_step=best_step)
+                        best_step=best_step,
+                        best_val_action_loss=(
+                            best_val_action_loss
+                            if math.isfinite(best_val_action_loss) else None),
+                        best_val_step=best_val_step)
         rank0_print(f"[train] done. {max_steps} windows. Saved to {output_dir}")
     elif is_rank0():
         rank0_print(f"[train] done. {max_steps} windows. Final checkpoint disabled; "
