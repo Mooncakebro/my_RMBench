@@ -24,8 +24,8 @@ DDP notes:
   - forward must go through `model(batch, memory)` (DDP.forward) — calling
     inner methods directly would skip gradient sync.
   - single-GPU runs are not wrapped in DDP; multi-GPU runs use
-    find_unused_parameters=True normally and static_graph=True when gradient
-    checkpointing is enabled.
+    find_unused_parameters=True because episode-start frames can legitimately
+    omit gradients for zero-input branches.
   - per-rank batch_size is the config value; global batch = batch * world_size.
   - checkpointing/logging are rank-0-only; window loss is all-reduced for logs.
 
@@ -345,6 +345,15 @@ def main():
         device = get_ddp_device(local_rank, world_size)
     else:
         device = torch.device(args.device)
+    if ddp_enabled and str(args.device).startswith("cuda") and device.type != "cuda":
+        visible_gpus = torch.cuda.device_count()
+        destroy_distributed()
+        raise RuntimeError(
+            f"torchrun launched {world_size} ranks, but only {visible_gpus} CUDA "
+            "device(s) are visible. Refusing the CPU/Gloo fallback for training. "
+            "Set NPROC to the number of entries in CUDA_VISIBLE_DEVICES "
+            "(for example, CUDA_VISIBLE_DEVICES=4,5,6,7 with NPROC=4)."
+        )
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
@@ -382,6 +391,15 @@ def main():
         trainer_cfg.save_final = bool(args.save_final)
     max_steps = int(trainer_cfg.get("max_steps", 100))
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
+    num_workers = (args.num_workers if args.num_workers is not None else int(
+        cfg.get("dataloader", {}).get("num_workers", 0)))
+    if variant == "compact" and num_workers > 1:
+        destroy_distributed()
+        raise ValueError(
+            "COMPACT recurrent training requires --num-workers 0 or 1. "
+            "Multiple DataLoader workers interleave different episodes and reset "
+            "the batch-slot memory instead of preserving frame continuity."
+        )
     log_interval = int(trainer_cfg.get("log_interval", 5))
     save_every = int(trainer_cfg.get("save_every_steps", 0))
     save_best = bool(trainer_cfg.get("save_best", False))
@@ -446,17 +464,20 @@ def main():
         gradient_checkpointing = bool(
             cfg.execution_module.compact.get("gradient_checkpointing", False)
         )
-        # COMPACT performs one backward over its recurrent window and needs
-        # static_graph with re-entrant checkpointing. The baseline instead
-        # performs multiple independent forward/backward passes under
-        # no_sync; PyTorch DDP cannot combine that pattern with static_graph.
+        # Do not use static_graph here. At an episode boundary, zero-valued
+        # previous-action inputs can make a small subset of recurrent branch
+        # parameters receive no gradient on that frame, while later frames
+        # use the same parameters. static_graph=True treats that as a graph
+        # violation and aborts on the next forward. The extra graph traversal
+        # from find_unused_parameters=True is required for this valid pattern.
+        # Both executor variants use non-reentrant checkpointing paths when
+        # gradient checkpointing is enabled, which is compatible with this DDP
+        # mode.
         baseline_incremental = variant == "baseline"
         model = DDP(model,
                     device_ids=[device.index] if device.type == "cuda" else None,
-                    find_unused_parameters=(baseline_incremental
-                                            or not gradient_checkpointing),
-                    static_graph=(gradient_checkpointing
-                                  and not baseline_incremental))
+                    find_unused_parameters=True,
+                    static_graph=False)
     raw_model = model.module if ddp_enabled else model
     if is_rank0():
         counts = raw_model.trainable_param_counts()
@@ -538,7 +559,7 @@ def main():
 
     loader = build_dataloader(
         cfg, args.task, rank=rank, world_size=world_size,
-        batch_size=batch_size, num_workers=args.num_workers,
+        batch_size=batch_size, num_workers=num_workers,
         episode_ids=train_episode_ids,
         episode_to_indices=probe_iterable.episode_to_indices,
         shuffle=True, infinite=True, image_augment=True)

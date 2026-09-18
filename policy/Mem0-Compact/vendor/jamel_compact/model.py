@@ -556,7 +556,13 @@ class JAMELCompactWrapper(nn.Module):
         )
 
         if config.gradient_checkpointing:
-            self.llm.gradient_checkpointing_enable()
+            try:
+                self.llm.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                # Older Transformers releases do not expose the kwargs.
+                self.llm.gradient_checkpointing_enable()
             self.llm.config.use_cache = False
             if lora_enabled(config.lora_rank) and lora_is_trainable:
                 enable_lora_gradient_checkpointing(self.llm)
