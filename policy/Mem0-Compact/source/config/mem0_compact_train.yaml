@@ -21,7 +21,7 @@ execution_module:
 
   # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
   compact:
-    mem_dim: 128
+    mem_dim: 512
     num_mem_tokens: 16
     num_heads: 8
     num_obs_tokens: 4
@@ -74,7 +74,7 @@ execution_module:
 
 # TBPTT training loop (idea.md §3)
 tbptt:
-  window_size: 8          # K — frames per backward window
+  window_size: 64          # K — frames per backward window
   detach_at_boundary: true
 
 dataloader:
