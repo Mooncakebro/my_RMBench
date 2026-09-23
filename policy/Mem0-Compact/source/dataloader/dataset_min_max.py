@@ -18,8 +18,9 @@ Key Features:
 import os
 import sys
 import json
+from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -336,6 +337,26 @@ class LeRobot_Dataset(Dataset):
                         f"Normalization field {name} must contain 16 values, "
                         f"got shape {tuple(values.shape)}"
                     )
+
+    def set_norm_stats(self, norm_stats: Dict[str, Sequence[float]]) -> None:
+        """Replace dataset-local statistics with shared statistics."""
+        required_stats = {"state_min", "state_max", "action_min", "action_max"}
+        missing_stats = required_stats - norm_stats.keys()
+        if missing_stats:
+            raise ValueError(f"Shared normalization stats missing: {sorted(missing_stats)}")
+        values = {
+            name: torch.as_tensor(norm_stats[name], dtype=torch.float32)
+            for name in required_stats
+        }
+        for name, tensor in values.items():
+            if tensor.numel() != 16:
+                raise ValueError(
+                    f"Normalization field {name} must contain 16 values, "
+                    f"got shape {tuple(tensor.shape)}"
+                )
+            setattr(self, name, tensor)
+        # __getitem__ uses these tensors whenever this marker is non-None.
+        self.norm_stats_path = "<shared>"
             
     def __len__(self):
         return len(self.dataset)
@@ -513,6 +534,150 @@ class LeRobot_Dataset(Dataset):
             "subtask_end": int(subtask_end) if isinstance(subtask_end, torch.Tensor) else subtask_end,  # int
             "global_task": global_task,
         }
+
+
+M1_MIX_TASKS = (
+    "observe_and_pickup",
+    "put_back_block",
+    "rearrange_blocks",
+    "swap_blocks",
+    "swap_T",
+)
+
+
+class M1MixLeRobotDataset(Dataset):
+    """Virtual union of the five M(1) LeRobot datasets.
+
+    Each source episode is assigned a unique virtual episode id. Samples retain
+    their task-specific instruction, while state/action normalization uses one
+    min/max range computed across all five tasks.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        features_to_load: Optional[List[str]] = None,
+        action_horizon: int = 30,
+        image_augment: bool = True,
+        norm_stats_path: Optional[str] = None,
+    ):
+        root = Path(root)
+        self.root = root
+        self.tasks = list(M1_MIX_TASKS)
+        self.datasets = []
+        for task in self.tasks:
+            task_root = root / task
+            if not task_root.is_dir():
+                raise FileNotFoundError(
+                    f"M1-mix task dataset not found: {task_root}. "
+                    "Generate all five LeRobot datasets first."
+                )
+            self.datasets.append(LeRobot_Dataset(
+                repo_id=task,
+                root=str(task_root),
+                features_to_load=features_to_load,
+                action_horizon=action_horizon,
+                image_augment=image_augment,
+            ))
+
+        stats_path = Path(norm_stats_path).expanduser() if norm_stats_path else (
+            root.parent / "assets" / "m1mix" / "norm_stats.json"
+        )
+        if stats_path.is_file():
+            with stats_path.open("r", encoding="utf-8") as file:
+                shared_stats = json.load(file)
+        else:
+            shared_stats = self._combined_stats()
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with stats_path.open("w", encoding="utf-8") as file:
+                json.dump(shared_stats, file, indent=2)
+            print(f"[m1mix] shared normalization stats: {stats_path}")
+        for dataset in self.datasets:
+            dataset.set_norm_stats(shared_stats)
+        self.norm_stats = shared_stats
+
+        self.index_map = []
+        self.episode_to_indices: Dict[int, List[int]] = {}
+        self.episode_to_task: Dict[int, str] = {}
+        next_episode_id = 0
+        global_index = 0
+        for dataset_index, (task, dataset) in enumerate(zip(self.tasks, self.datasets)):
+            local_episode_to_indices = self._episode_indices(dataset)
+            local_episode_ids = sorted(local_episode_to_indices)
+            local_to_virtual = {
+                local_id: next_episode_id + offset
+                for offset, local_id in enumerate(local_episode_ids)
+            }
+            for local_id in local_episode_ids:
+                virtual_id = local_to_virtual[local_id]
+                self.episode_to_indices[virtual_id] = []
+                self.episode_to_task[virtual_id] = task
+            for local_episode_id, local_indices in local_episode_to_indices.items():
+                virtual_id = local_to_virtual[local_episode_id]
+                for local_idx in local_indices:
+                    self.index_map.append((dataset_index, local_idx, virtual_id))
+                    self.episode_to_indices[virtual_id].append(global_index)
+                    global_index += 1
+            next_episode_id += len(local_episode_ids)
+
+    @staticmethod
+    def _episode_indices(dataset: LeRobot_Dataset) -> Dict[int, List[int]]:
+        """Read episode ranges without decoding every video frame."""
+        root = Path(dataset.dataset.root)
+        episode_files = sorted(
+            (root / "meta" / "episodes").glob("chunk-*/file-*.parquet")
+        )
+        if episode_files:
+            import pandas as pd
+            frame = pd.concat(
+                [pd.read_parquet(path) for path in episode_files],
+                ignore_index=True,
+            ).sort_values("episode_index")
+            return {
+                int(row.episode_index): list(
+                    range(int(row.dataset_from_index), int(row.dataset_to_index))
+                )
+                for row in frame[
+                    ["episode_index", "dataset_from_index", "dataset_to_index"]
+                ].itertuples(index=False)
+            }
+
+        # Older LeRobot layouts may not have episode parquet metadata.
+        episode_indices: Dict[int, List[int]] = {}
+        for local_idx in range(len(dataset)):
+            episode_id = int(dataset.dataset.dataset[local_idx]["episode_index"])
+            episode_indices.setdefault(episode_id, []).append(local_idx)
+        return episode_indices
+
+    def _combined_stats(self) -> Dict[str, List[float]]:
+        mins = {}
+        maxs = {}
+        for dataset in self.datasets:
+            stats = dataset.dataset.meta.stats
+            for feature, min_key, max_key in (
+                ("observation.state", "state_min", "state_max"),
+                ("action", "action_min", "action_max"),
+            ):
+                feature_min = torch.as_tensor(stats[feature]["min"], dtype=torch.float32)
+                feature_max = torch.as_tensor(stats[feature]["max"], dtype=torch.float32)
+                mins[min_key] = feature_min if min_key not in mins else torch.minimum(mins[min_key], feature_min)
+                maxs[max_key] = feature_max if max_key not in maxs else torch.maximum(maxs[max_key], feature_max)
+        return {
+            "state_min": mins["state_min"].tolist(),
+            "state_max": maxs["state_max"].tolist(),
+            "action_min": mins["action_min"].tolist(),
+            "action_max": maxs["action_max"].tolist(),
+        }
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, index):
+        dataset_index, local_index, virtual_episode_id = self.index_map[index]
+        sample = self.datasets[dataset_index][local_index]
+        sample["episode_id"] = virtual_episode_id
+        sample["global_task"] = sample.get("global_task") or sample.get("lang", "")
+        return sample
 
 
 def analyze_dataset_distribution(dataset: LeRobot_Dataset, save_dir: str = "distribution_plots"):

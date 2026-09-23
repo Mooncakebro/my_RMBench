@@ -76,6 +76,12 @@ bash scripts/convert_all.sh
 #   python scripts/hdf5_to_lerobot/Mn_dataset_to_lerobot.py --task cover_blocks --episodes 50
 #   python scripts/gen_norm_stats.py --task swap_blocks
 
+# Joint M(1) training is selected with TASK=m1mix. The loader combines these
+# five existing directories virtually (no data copy), preserves each task's
+# instruction, assigns globally unique episode IDs, computes shared min/max
+# statistics, and writes assets/m1mix/norm_stats.json:
+#   observe_and_pickup, put_back_block, rearrange_blocks, swap_blocks, swap_T
+
 # Transfer both generated trees to the same repo-relative paths on the server:
 #   policy/Mem0-Compact/lerobot_datasets/  (training data)
 #   policy/Mem0-Compact/assets/             (norm_stats.json + instructions)
@@ -143,6 +149,37 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
 #     to control fraction/interval/seed, or set enabled=false to fall back to
 #     training-loss selection
 #   - both files are full resume checkpoints (model + optimizer + scheduler)
+#
+# 8-GPU M(1)-mix Compact run:
+CONFIG=source/config/mem0_compact_train.yaml \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 \
+  TASK=m1mix BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.0001 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 OUTPUT_DIR=runs/compact_m1mix \
+  EXTRA_ARGS="--window-size 8 --grad-ckpt 1 --num-workers 1" \
+  bash source/training/train_ddp.sh 2>&1 | tee train_compact_m1mix.log
+
+# Warm-start from an original Mem-0 execution checkpoint. Compatible Qwen and
+# DiT action-head tensors are loaded; Compact side-memory, previous-action MLP,
+# MemoryBank, and incompatible classifier tensors are initialized separately.
+MEM0_CKPT=/path/to/original/m1_mix_execution_checkpoint.pt
+CONFIG=source/config/mem0_compact_train.yaml \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 \
+  TASK=m1mix BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.0001 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 OUTPUT_DIR=runs/compact_m1mix_warm \
+  EXTRA_ARGS="--init-from-mem0 $MEM0_CKPT --window-size 8 --grad-ckpt 1 --num-workers 1" \
+  bash source/training/train_ddp.sh 2>&1 | tee train_compact_m1mix_warm.log
+
+# Warm-started stateless baseline. Its one-frame window is gradient
+# accumulation only; it does not perform TBPTT or carry Compact memory.
+CONFIG=source/config/mem0_baseline_train.yaml \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 \
+  TASK=m1mix BATCH_SIZE=1 MAX_STEPS=30000 \
+  SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.0001 \
+  SAVE_EVERY_STEPS=0 SAVE_FINAL=1 OUTPUT_DIR=runs/baseline_m1mix_warm \
+  EXTRA_ARGS="--init-from-mem0 $MEM0_CKPT --window-size 1 --grad-ckpt 1 --num-workers 1" \
+  bash source/training/train_ddp.sh 2>&1 | tee train_baseline_m1mix_warm.log
 #
 # The action head now honors action_model.repeated_diffusion_steps=8. It repeats
 # only DiT inputs/targets (not the expensive Qwen forward), matching Mem-0's

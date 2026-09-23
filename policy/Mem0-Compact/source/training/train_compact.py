@@ -67,7 +67,10 @@ PROJECT_ROOT = THIS_DIR.parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from source.dataloader.dataset_min_max import LeRobot_Dataset
+from source.dataloader.dataset_min_max import (
+    M1MixLeRobotDataset,
+    LeRobot_Dataset,
+)
 from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
 from source.models.execution_module.mem0_compact_executor import Mem0CompactExecutor
 from source.models.execution_module.mem0_baseline_executor import Mem0BaselineExecutor
@@ -129,6 +132,11 @@ def parse_args():
                    help="1 saves ckpt_final.pt after normal training completion")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--resume", type=Path, default=None)
+    p.add_argument(
+        "--init-from-mem0", type=Path, default=None,
+        help="initialize shared Qwen and action-head weights from an original "
+             "Mem-0 checkpoint; Compact memory is left randomly initialized",
+    )
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -160,7 +168,10 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
 
     repo_id = cfg.vla_dataset.RMBench.get("repo_id", "")
     root = None
-    if task:
+    if task == "m1mix":
+        repo_id = "m1mix"
+        root = str(PROJECT_ROOT / "lerobot_datasets")
+    elif task:
         # Local lerobot dataset: root points AT the dataset dir (lerobot 0.4.4)
         repo_id = task
         root = str(PROJECT_ROOT / "lerobot_datasets" / task)
@@ -177,18 +188,29 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
     ])
     norm_stats_path = trainer_cfg.get("norm_stats_path", None)
     if base_dataset is None:
-        base_dataset = LeRobot_Dataset(
-            repo_id=repo_id,
-            root=root,
-            features_to_load=list(features_to_load),
-            action_horizon=action_horizon,
-            norm_stats_path=norm_stats_path,
-            image_augment=image_augment,
-        )
+        if task == "m1mix":
+            base_dataset = M1MixLeRobotDataset(
+                root=root,
+                features_to_load=list(features_to_load),
+                action_horizon=action_horizon,
+                image_augment=image_augment,
+                norm_stats_path=norm_stats_path,
+            )
+        else:
+            base_dataset = LeRobot_Dataset(
+                repo_id=repo_id,
+                root=root,
+                features_to_load=list(features_to_load),
+                action_horizon=action_horizon,
+                norm_stats_path=norm_stats_path,
+                image_augment=image_augment,
+            )
     if shuffle is None:
         shuffle = bool(cfg.get("dataloader", {}).get("shuffle_episodes", True))
     if infinite is None:
         infinite = bool(cfg.get("dataloader", {}).get("infinite", True))
+    if episode_to_indices is None:
+        episode_to_indices = getattr(base_dataset, "episode_to_indices", None)
     iterable = RandomEpisodeIterableDataset(
         base_dataset=base_dataset,
         rank=rank, world_size=world_size,
@@ -257,8 +279,118 @@ def all_ranks_finite(value: torch.Tensor) -> bool:
     return bool(finite_flag.item())
 
 
+def load_mem0_warm_start(model: torch.nn.Module, checkpoint_path: Path) -> None:
+    """Load compatible original Mem-0 Qwen and DiT weights.
+
+    Original Mem-0 stores the Qwen module below ``qwen_model.model`` while
+    this repository stores it below ``llm`` (baseline) or ``wrapper.llm``
+    (Compact). The action head has the same parameter structure. MemoryBank,
+    Compact side-memory, previous-action, and classifier parameters are not
+    transferred because their structures or conditioning tokens differ.
+    """
+    checkpoint_path = checkpoint_path.expanduser()
+    if checkpoint_path.is_dir():
+        candidates = [
+            checkpoint_path / "ckpt_final.pt",
+            checkpoint_path / "model.pt",
+            checkpoint_path / "pytorch_model.bin",
+            checkpoint_path / "model.safetensors",
+        ]
+        checkpoint_path = next(
+            (path for path in candidates if path.is_file()), None
+        )
+    if checkpoint_path is None or not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Mem-0 warm-start checkpoint not found. Pass a .pt/.bin/.safetensors "
+            "execution checkpoint or a directory containing one."
+        )
+
+    if checkpoint_path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "Loading a .safetensors Mem-0 checkpoint requires safetensors"
+            ) from exc
+        payload = load_file(str(checkpoint_path), device="cpu")
+    else:
+        try:
+            payload = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False, mmap=True
+            )
+        except TypeError:
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    if isinstance(payload, dict):
+        source_state = (
+            payload.get("model_state_dict")
+            or payload.get("model")
+            or payload.get("state_dict")
+        )
+        if source_state is None and all(
+            isinstance(value, torch.Tensor) for value in payload.values()
+        ):
+            source_state = payload
+    else:
+        source_state = None
+    if not isinstance(source_state, dict):
+        raise ValueError(
+            f"Unsupported Mem-0 checkpoint format: {checkpoint_path}. "
+            "Expected model_state_dict, model, or state_dict."
+        )
+
+    target_state = model.state_dict()
+    qwen_prefix = "wrapper.llm." if hasattr(model, "wrapper") else "llm."
+    mapped = {}
+    counts = {"qwen": 0, "action": 0}
+    skipped_shape = []
+
+    for source_name, value in source_state.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        source_name = str(source_name)
+        while source_name.startswith("module."):
+            source_name = source_name[len("module."):]
+
+        target_name = None
+        group = None
+        if source_name.startswith("qwen_model.model."):
+            target_name = qwen_prefix + source_name[len("qwen_model.model."):]
+            group = "qwen"
+        elif source_name.startswith("action_model."):
+            target_name = source_name
+            group = "action"
+        if target_name is None or target_name not in target_state:
+            continue
+        if tuple(target_state[target_name].shape) != tuple(value.shape):
+            skipped_shape.append((source_name, target_name, tuple(value.shape),
+                                  tuple(target_state[target_name].shape)))
+            continue
+        mapped[target_name] = value
+        counts[group] += 1
+
+    if not mapped:
+        raise RuntimeError(
+            f"No compatible Qwen/DiT tensors found in {checkpoint_path}. "
+            "Check that this is an original Mem-0 execution checkpoint."
+        )
+    target_state.update(mapped)
+    model.load_state_dict(target_state, strict=True)
+    rank0_print(
+        f"[init] Mem-0 warm start: qwen={counts['qwen']} tensors, "
+        f"action={counts['action']} tensors, "
+        f"shape_skipped={len(skipped_shape)}; Compact/new modules remain initialized"
+    )
+    if counts["qwen"] == 0:
+        raise RuntimeError(
+            "Mem-0 checkpoint supplied no compatible Qwen tensors; refusing an "
+            "action-head-only warm start that would hide a naming mismatch."
+        )
+
+
 def split_episode_ids(episode_ids: Sequence[int], validation_fraction: float,
-                      split_seed: int, max_validation_episodes: int = 0):
+                      split_seed: int, max_validation_episodes: int = 0,
+                      episode_groups: Optional[dict[int, str]] = None):
     """Return deterministic, episode-disjoint train and validation IDs."""
     all_ids = sorted(int(episode_id) for episode_id in episode_ids)
     if not 0.0 < validation_fraction < 1.0:
@@ -266,11 +398,25 @@ def split_episode_ids(episode_ids: Sequence[int], validation_fraction: float,
     if len(all_ids) < 2:
         raise ValueError("episode-level validation requires at least two episodes")
 
-    val_count = max(1, int(round(len(all_ids) * validation_fraction)))
-    val_count = min(val_count, len(all_ids) - 1)
-    shuffled = all_ids.copy()
-    random.Random(split_seed).shuffle(shuffled)
-    validation_ids = shuffled[:val_count]
+    if episode_groups:
+        # Keep every M1 task represented in validation when possible.
+        grouped = {}
+        for episode_id in all_ids:
+            grouped.setdefault(episode_groups[episode_id], []).append(episode_id)
+        rng = random.Random(split_seed)
+        validation_ids = []
+        for group_ids in grouped.values():
+            shuffled_group = list(group_ids)
+            rng.shuffle(shuffled_group)
+            count = max(1, int(round(len(shuffled_group) * validation_fraction)))
+            count = min(count, len(shuffled_group) - 1)
+            validation_ids.extend(shuffled_group[:count])
+    else:
+        val_count = max(1, int(round(len(all_ids) * validation_fraction)))
+        val_count = min(val_count, len(all_ids) - 1)
+        shuffled = all_ids.copy()
+        random.Random(split_seed).shuffle(shuffled)
+        validation_ids = shuffled[:val_count]
     if max_validation_episodes > 0:
         validation_ids = validation_ids[:max_validation_episodes]
     validation_ids = sorted(validation_ids)
@@ -372,6 +518,11 @@ def main():
         cfg.execution_module.qwen_vl.model_path = args.model_path
         cprint(f"[train] qwen_vl.model_path overridden: {args.model_path}", "cyan")
 
+    if args.task == "m1mix" and not cfg.trainer.get("norm_stats_path"):
+        cfg.trainer.norm_stats_path = str(
+            PROJECT_ROOT / "assets" / "m1mix" / "norm_stats.json"
+        )
+
     if args.freeze_base is not None:
         cfg.execution_module.compact.freeze_base = bool(args.freeze_base)
     if args.grad_ckpt is not None:
@@ -460,6 +611,8 @@ def main():
     # ── Model ──
     rank0_print(f"[train] building {variant} executor (this loads Qwen3-VL-2B)...")
     model = EXECUTOR_VARIANTS[variant](cfg, device=device).to(device)
+    if args.init_from_mem0 is not None:
+        load_mem0_warm_start(model, args.init_from_mem0)
     if ddp_enabled:
         gradient_checkpointing = bool(
             cfg.execution_module.compact.get("gradient_checkpointing", False)
@@ -546,10 +699,11 @@ def main():
         num_workers=0, shuffle=False, infinite=False, image_augment=False)
     probe_iterable = probe_loader.dataset
     all_episode_ids = sorted(probe_iterable.episode_to_indices.keys())
+    episode_groups = getattr(probe_iterable.base_dataset, "episode_to_task", None)
     if validation_enabled:
         train_episode_ids, validation_episode_ids = split_episode_ids(
             all_episode_ids, validation_fraction, validation_seed,
-            validation_max_episodes)
+            validation_max_episodes, episode_groups=episode_groups)
     else:
         train_episode_ids, validation_episode_ids = all_episode_ids, []
     if not train_episode_ids:

@@ -74,7 +74,7 @@ execution_module:
 
 # TBPTT training loop (idea.md §3)
 tbptt:
-  window_size: 64          # K — frames per backward window
+  window_size: 8          # K — frames per backward window
   detach_at_boundary: true
 
 dataloader:
