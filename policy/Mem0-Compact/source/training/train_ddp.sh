@@ -9,7 +9,8 @@
 #   MASTER_PORT  torchrun port (default 29500)
 #   TASK         dataset task under lerobot_datasets/ (default swap_blocks)
 #   BATCH_SIZE   per-rank batch (default 1; global = BATCH_SIZE * NPROC)
-#   MAX_STEPS    TBPTT windows (default 30000)
+#   MAX_STEPS    optimizer updates (default 30000)
+#   GRAD_ACCUM_WINDOWS detached TBPTT windows per optimizer update (default 1)
 #   FREEZE_BASE  1 to freeze the Qwen base (debug only)
 #   CONFIG       config yaml (default source/config/mem0_compact_train.yaml)
 #   VARIANT      executor variant for the default output dir (default: read
@@ -29,6 +30,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 TASK=${TASK:-swap_blocks}
 BATCH_SIZE=${BATCH_SIZE:-1}
 MAX_STEPS=${MAX_STEPS:-30000}
+GRAD_ACCUM_WINDOWS=${GRAD_ACCUM_WINDOWS:-1}
 FREEZE_BASE=${FREEZE_BASE:-0}
 CONFIG=${CONFIG:-source/config/mem0_compact_train.yaml}
 # Variant-aware default output dir: read execution_module.variant from the
@@ -48,6 +50,7 @@ TRAIN_ARGS=(
   --config "$CONFIG"
   --task "$TASK" --device cuda
   --batch-size "$BATCH_SIZE" --max-steps "$MAX_STEPS"
+  --grad-accum-windows "$GRAD_ACCUM_WINDOWS"
   --output-dir "$OUTPUT_DIR"
   --freeze-base "$FREEZE_BASE"
   --save-best "$SAVE_BEST"

@@ -136,8 +136,11 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/baseline_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
-# 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU; start at
-# 1 and scale only after confirming memory use. Global batch = BATCH_SIZE*NPROC.
+# 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU. For
+# Compact, keep BATCH_SIZE=1 and use detached TBPTT-window accumulation when a
+# larger effective update is required. `window_size=8` and
+# `grad_accum_windows=7` expose 1 x 8 x 7 x 8 = 448 frames globally per
+# optimizer update, while gradients still stop every 8 frames.
 # Checkpoint policy:
 #   - after step 1000, save_best=true overwrites ckpt_best.pt whenever the
 #     fixed-seed, episode-disjoint validation action loss reaches a new minimum
@@ -154,6 +157,7 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
 CONFIG=source/config/mem0_compact_train.yaml \
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 \
   TASK=m1mix BATCH_SIZE=1 MAX_STEPS=30000 \
+  GRAD_ACCUM_WINDOWS=7 \
   SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.0001 \
   SAVE_EVERY_STEPS=0 SAVE_FINAL=1 OUTPUT_DIR=runs/compact_m1mix \
   EXTRA_ARGS="--window-size 8 --grad-ckpt 1 --num-workers 1" \
@@ -166,9 +170,10 @@ MEM0_CKPT=/path/to/original/m1_mix_execution_checkpoint.pt
 CONFIG=source/config/mem0_compact_train.yaml \
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 \
   TASK=m1mix BATCH_SIZE=1 MAX_STEPS=30000 \
+  GRAD_ACCUM_WINDOWS=7 \
   SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.0001 \
   SAVE_EVERY_STEPS=0 SAVE_FINAL=1 OUTPUT_DIR=runs/compact_m1mix_warm \
-  EXTRA_ARGS="--init-from-mem0 $MEM0_CKPT --window-size 8 --grad-ckpt 1 --num-workers 1" \
+  EXTRA_ARGS="--model-path $BASE_MODEL --init-from-mem0 $MEM0_CKPT --window-size 8 --grad-ckpt 1 --num-workers 1" \
   bash source/training/train_ddp.sh 2>&1 | tee train_compact_m1mix_warm.log
 
 # Warm-started stateless baseline. Its one-frame window is gradient
@@ -187,12 +192,13 @@ CONFIG=source/config/mem0_baseline_train.yaml \
 #
 # DDP notes:
 #   - NPROC=1 uses direct Python; NPROC>1 uses torchrun, one rank per GPU
-#   - with gradient checkpointing, multi-GPU DDP uses static_graph mode to
-#     avoid reentrant checkpoint reducer errors
-#   - episodes are sharded per rank
-#     (episode % world_size == rank), global batch = batch_size x NPROC
+#   - multi-GPU DDP keeps static_graph=false and finds unused parameters,
+#     because episode boundaries can change which recurrent branches run
+#   - episodes are sharded per rank (episode % world_size == rank)
+#   - global frames per optimizer update = batch_size x NPROC x
+#     window_size x grad_accum_windows
 #   - memory state (M, P, e) is per-rank; no cross-rank coupling
-#   - window loss is averaged across ranks for logging only
+#   - accumulated update loss is averaged across ranks for logging only
 #   - keep `--num-workers 1`; multiple workers can break per-slot temporal order
 #   - single-GPU multi-rank debugging auto-falls back to gloo+cpu
 #     (NCCL refuses two ranks on one physical device)

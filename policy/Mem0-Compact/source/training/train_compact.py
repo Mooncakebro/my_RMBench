@@ -8,6 +8,7 @@ Per idea.md §3:
   - memory (M, P, e per layer) + prev_action are threaded across batches and
     are per-sample / rank-local — no cross-rank coupling
   - loss accumulates over a K-frame window; ONE backward per window
+  - multiple detached windows can accumulate before one optimizer update
   - memory is detached at window boundaries (gradients never cross windows)
   - when a batch slot's episode_id changes, that slot's memory is re-initialized
     and its prev_action reset to zeros (episode start; no reset at subtask
@@ -27,17 +28,18 @@ DDP notes:
     find_unused_parameters=True because episode-start frames can legitimately
     omit gradients for zero-input branches.
   - per-rank batch_size is the config value; global batch = batch * world_size.
-  - checkpointing/logging are rank-0-only; window loss is all-reduced for logs.
+  - checkpointing/logging are rank-0-only; update loss is all-reduced for logs.
 
 Example (single process):
     python source/training/train_compact.py \
         --config source/config/mem0_compact_train.yaml \
         --task swap_blocks --freeze-base 1 --max-steps 20
 
-Example (DDP, 8 GPUs):
+Example (DDP, 8 GPUs, Mem-0-sized update):
     torchrun --nproc_per_node=8 source/training/train_compact.py \
         --config source/config/mem0_compact_train.yaml \
-        --task swap_blocks --batch-size 56 --max-steps 30000
+        --task m1mix --batch-size 1 --window-size 8 \
+        --grad-accum-windows 7 --max-steps 30000
     (see source/training/train_ddp.sh)
 """
 from __future__ import annotations
@@ -111,6 +113,9 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--window-size", type=int, default=None,
                    help="TBPTT window K override (small-GPU debug: use 1)")
+    p.add_argument("--grad-accum-windows", type=int, default=None,
+                   help="number of detached TBPTT windows accumulated per "
+                        "optimizer update (default: 1)")
     p.add_argument("--opt-sgd", action="store_true",
                    help="use plain SGD instead of AdamW (small-GPU debug "
                         "escape hatch; AdamW states don't fit on 8GB)")
@@ -570,6 +575,11 @@ def main():
     # TBPTT window
     tbptt_cfg = cfg.get("tbptt", {})
     window_size = args.window_size or int(tbptt_cfg.get("window_size", 8))
+    grad_accum_windows = args.grad_accum_windows
+    if grad_accum_windows is None:
+        grad_accum_windows = int(trainer_cfg.get("grad_accum_windows", 1))
+    if window_size < 1 or grad_accum_windows < 1:
+        raise ValueError("window-size and grad-accum-windows must be positive")
     if not bool(tbptt_cfg.get("detach_at_boundary", True)):
         raise ValueError(
             "tbptt.detach_at_boundary=false is unsupported with per-window "
@@ -577,6 +587,7 @@ def main():
         )
     grad_clip = float(trainer_cfg.get("grad_clip_norm", 2.5))
     warmup_ratio = float(trainer_cfg.get("warmup_ratio", 0.05))
+    trainer_cfg.grad_accum_windows = grad_accum_windows
 
     lr_cfg = trainer_cfg.get("learning_rate", {})
     base_lr = float(lr_cfg.get("qwen_model", 1e-5))
@@ -737,10 +748,11 @@ def main():
     model.train()
     memory = raw_model.init_memory(batch_size, device)
     prev_episode = torch.full((batch_size,), -1, dtype=torch.long, device=device)
-    total_iters = max_steps * window_size
+    total_iters = max_steps * window_size * grad_accum_windows
 
-    rank0_print(f"[train] TBPTT window={window_size}, steps={max_steps}, "
-                f"batch={batch_size}x{world_size}, iters={total_iters}")
+    rank0_print(f"[train] TBPTT window={window_size}, accum_windows="
+                f"{grad_accum_windows}, optimizer_steps={max_steps}, "
+                f"batch={batch_size}x{world_size}, frames={total_iters}")
 
     step_times = []
     # Baseline frames are independent (no recurrent memory), so retaining K
@@ -753,86 +765,118 @@ def main():
         t0 = time.time()
         profiling = args.profile_steps > 0 and (step - start_step) < args.profile_steps
         profile_times = {"data": 0.0, "forward": 0.0, "backward": 0.0}
-        if incremental_bwd:
-            optimizer.zero_grad(set_to_none=True)
-        window_loss = torch.zeros((), device=device, dtype=torch.float32)
+        optimizer.zero_grad(set_to_none=True)
+        update_loss = torch.zeros((), device=device, dtype=torch.float32)
         log_parts = {}
-        for k in range(window_size):
-            if profiling:
-                synchronize_device(device)
-                phase_start = time.perf_counter()
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                batch = next(data_iter)
-            if profiling:
-                profile_times["data"] += time.perf_counter() - phase_start
-
-            ep_ids = batch["episode_id"].to(device)
-
-            # Per-slot episode reset: memory + prev_action + episode tracker.
-            reset_mask = [(prev_episode[i] < 0 or prev_episode[i] != ep_ids[i])
-                          for i in range(batch_size)]
-            memory = raw_model.reset_memory_rows(memory, reset_mask, device)
-            prev_action = batch["state"].squeeze(1).to(device).clone().detach()
-            for i in range(batch_size):
-                if reset_mask[i]:
-                    prev_action[i] = 0.0
-            prev_episode = ep_ids.clone()
-            batch["prev_action"] = prev_action
-
-            # DDP.no_sync() must include BOTH forward and backward. Wrapping
-            # backward alone does not disable gradient synchronization.
-            sync_context = (
+        loss_scale = window_size * grad_accum_windows
+        for accum_idx in range(grad_accum_windows):
+            window_loss = torch.zeros((), device=device, dtype=torch.float32)
+            # Compact keeps the graph for one TBPTT window and backpropagates
+            # once at its end. The no_sync context must cover all forwards and
+            # that backward call. Baseline backpropagates frame by frame.
+            window_sync_context = (
                 model.no_sync()
-                if incremental_bwd and ddp_enabled and k < window_size - 1
+                if ddp_enabled and not incremental_bwd
+                and accum_idx < grad_accum_windows - 1
                 else nullcontext()
             )
-            with sync_context:
-                # Forward MUST go through the DDP wrapper so reducer hooks are
-                # installed for this frame.
-                if profiling:
-                    synchronize_device(device)
-                    phase_start = time.perf_counter()
-                loss_dict, memory = model(batch, memory)
-                if profiling:
-                    synchronize_device(device)
-                    profile_times["forward"] += time.perf_counter() - phase_start
-                if incremental_bwd:
-                    scaled = loss_dict["total"] / window_size
+            with window_sync_context:
+                for k in range(window_size):
                     if profiling:
                         synchronize_device(device)
                         phase_start = time.perf_counter()
-                    scaled.backward()
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        data_iter = iter(loader)
+                        batch = next(data_iter)
+                    if profiling:
+                        profile_times["data"] += time.perf_counter() - phase_start
+
+                    ep_ids = batch["episode_id"].to(device)
+
+                    # Per-slot episode reset: memory + prev_action + tracker.
+                    reset_mask = [
+                        (prev_episode[i] < 0 or prev_episode[i] != ep_ids[i])
+                        for i in range(batch_size)
+                    ]
+                    memory = raw_model.reset_memory_rows(memory, reset_mask, device)
+                    prev_action = batch["state"].squeeze(1).to(device).clone().detach()
+                    for i in range(batch_size):
+                        if reset_mask[i]:
+                            prev_action[i] = 0.0
+                    prev_episode = ep_ids.clone()
+                    batch["prev_action"] = prev_action
+
+                    # DDP.no_sync() must include BOTH forward and backward.
+                    frame_sync_context = (
+                        model.no_sync()
+                        if incremental_bwd and ddp_enabled and not (
+                            accum_idx == grad_accum_windows - 1
+                            and k == window_size - 1
+                        )
+                        else nullcontext()
+                    )
+                    with frame_sync_context:
+                        # Forward MUST go through DDP so reducer hooks are
+                        # installed for every frame.
+                        if profiling:
+                            synchronize_device(device)
+                            phase_start = time.perf_counter()
+                        loss_dict, memory = model(batch, memory)
+                        if profiling:
+                            synchronize_device(device)
+                            profile_times["forward"] += (
+                                time.perf_counter() - phase_start
+                            )
+                        for key, value in loss_dict.items():
+                            if isinstance(value, torch.Tensor):
+                                log_parts[key] = log_parts.get(key, 0.0) + (
+                                    float(value.detach()) / loss_scale
+                                )
+                        if incremental_bwd:
+                            scaled = loss_dict["total"] / loss_scale
+                            if profiling:
+                                synchronize_device(device)
+                                phase_start = time.perf_counter()
+                            scaled.backward()
+                            if profiling:
+                                synchronize_device(device)
+                                profile_times["backward"] += (
+                                    time.perf_counter() - phase_start
+                                )
+                            update_loss = update_loss + scaled.detach()
+                        else:
+                            window_loss = window_loss + (
+                                loss_dict["total"] / loss_scale
+                            )
+                if not incremental_bwd:
+                    if profiling:
+                        synchronize_device(device)
+                        phase_start = time.perf_counter()
+                    window_loss.backward()
                     if profiling:
                         synchronize_device(device)
                         profile_times["backward"] += (
                             time.perf_counter() - phase_start
                         )
-                    window_loss = window_loss + scaled.detach()
-                else:
-                    window_loss = window_loss + loss_dict["total"] / window_size
-            if k == window_size - 1:
-                log_parts = {key: float(value.detach())
-                             for key, value in loss_dict.items()
-                             if isinstance(value, torch.Tensor)}
+                    update_loss = update_loss + window_loss.detach()
 
-        if not all_ranks_finite(window_loss):
+            # TBPTT truncation occurs after every K-frame window, including
+            # windows accumulated into the same optimizer update.
+            memory = raw_model.detach_memory(memory)
+
+        if not all_ranks_finite(update_loss):
             rank0_print(
-                f"[train] step {step+1}: non-finite window loss on at least "
+                f"[train] step {step+1}: non-finite accumulated loss on at least "
                 "one rank, skipping on all ranks"
             )
             optimizer.zero_grad(set_to_none=True)
-            memory = raw_model.detach_memory(memory)
             continue
 
         if profiling:
             synchronize_device(device)
             phase_start = time.perf_counter()
-        if not incremental_bwd:
-            optimizer.zero_grad(set_to_none=True)
-            window_loss.backward()
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
         grad_norm = torch.nn.utils.clip_grad_norm_(
             trainable_parameters,
@@ -844,7 +888,6 @@ def main():
                 "one rank, skipping on all ranks"
             )
             optimizer.zero_grad(set_to_none=True)
-            memory = raw_model.detach_memory(memory)
             continue
         optimizer.step()
         scheduler.step()
@@ -852,20 +895,17 @@ def main():
             synchronize_device(device)
             profile_times["backward_optimizer"] = time.perf_counter() - phase_start
 
-        # TBPTT: gradients never cross windows.
-        memory = raw_model.detach_memory(memory)
-
-        # Sync window loss across ranks for logging (only; not reused in graph).
-        all_reduce_avg(window_loss)
+        # Sync accumulated loss across ranks for logging only.
+        all_reduce_avg(update_loss)
 
         step_times.append(time.time() - t0)
         if (step + 1) % log_interval == 0 or step == start_step:
             parts = " ".join(f"{k} {v:.4f}" for k, v in log_parts.items())
             avg_t = sum(step_times[-log_interval:]) / len(step_times[-log_interval:])
             rank0_print(f"[train] step {step+1}/{max_steps} "
-                        f"loss {window_loss.item():.4f} "
+                        f"loss {update_loss.item():.4f} "
                         f"({parts}) lr {scheduler.get_last_lr()[0]:.2e} "
-                        f"({avg_t:.2f}s/window)")
+                        f"({avg_t:.2f}s/update)")
         if profiling:
             rank0_print(
                 f"[profile] step {step+1}: "
@@ -875,7 +915,7 @@ def main():
                 f"backward+optimizer={profile_times['backward_optimizer']:.2f}s"
             )
 
-        current_loss = float(window_loss.detach().item())
+        current_loss = float(update_loss.detach().item())
         should_validate = (
             validation_enabled
             and ((step + 1) % validation_interval == 0 or step + 1 == max_steps)
@@ -963,10 +1003,16 @@ def main():
                             best_val_action_loss
                             if math.isfinite(best_val_action_loss) else None),
                         best_val_step=best_val_step)
-        rank0_print(f"[train] done. {max_steps} windows. Saved to {output_dir}")
+        rank0_print(
+            f"[train] done. {max_steps} optimizer updates "
+            f"({total_iters} frames). Saved to {output_dir}"
+        )
     elif is_rank0():
-        rank0_print(f"[train] done. {max_steps} windows. Final checkpoint disabled; "
-                    f"periodic checkpoints are in {output_dir}")
+        rank0_print(
+            f"[train] done. {max_steps} optimizer updates "
+            f"({total_iters} frames). Final checkpoint disabled; periodic "
+            f"checkpoints are in {output_dir}"
+        )
     destroy_distributed()
 
 
