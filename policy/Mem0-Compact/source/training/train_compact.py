@@ -934,6 +934,18 @@ def main():
 
         # Sync accumulated loss across ranks for logging only.
         all_reduce_avg(update_loss)
+        if log_parts and dist.is_initialized() and dist.get_world_size() > 1:
+            log_keys = sorted(log_parts)
+            log_values = torch.tensor(
+                [log_parts[key] for key in log_keys],
+                device=device,
+                dtype=torch.float32,
+            )
+            all_reduce_avg(log_values)
+            log_parts = {
+                key: float(value)
+                for key, value in zip(log_keys, log_values.tolist())
+            }
 
         step_times.append(time.time() - t0)
         if (step + 1) % log_interval == 0 or step == start_step:
