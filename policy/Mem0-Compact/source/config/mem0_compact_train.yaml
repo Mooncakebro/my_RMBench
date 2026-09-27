@@ -109,7 +109,7 @@ trainer:
 
 validation:
   enabled: true
-  fraction: 0.03
+  fraction: 0.025
   interval_steps: 1000
   seed: 100045
   max_episodes: 0         # 0 = use the complete validation split
