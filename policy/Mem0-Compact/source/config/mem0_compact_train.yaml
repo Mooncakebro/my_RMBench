@@ -109,11 +109,11 @@ trainer:
 
 validation:
   enabled: true
-  fraction: 0.01
+  fraction: 0.03
   interval_steps: 1000
   seed: 100045
   max_episodes: 0         # 0 = use the complete validation split
-  max_frames_per_rank: 256  # bound distributed validation wall time; 0 = all
+  max_frames_per_rank: 1024  # bound distributed validation wall time; 0 = all
 
 vla_dataset:
   RMBench:
