@@ -135,6 +135,16 @@ def parse_args():
                    help="save numbered full checkpoints every N steps; 0 disables")
     p.add_argument("--save-final", type=int, default=None,
                    help="1 saves ckpt_final.pt after normal training completion")
+    p.add_argument("--validation-enabled", type=int, default=None,
+                   help="1 enables episode validation; 0 disables it")
+    p.add_argument("--validation-interval", type=int, default=None,
+                   help="optimizer updates between validation runs")
+    p.add_argument("--validation-max-episodes", type=int, default=None,
+                   help="maximum held-out episodes used per validation run; "
+                        "0 means all")
+    p.add_argument("--validation-max-frames", type=int, default=None,
+                   help="maximum validation frames processed per rank; "
+                        "0 means all assigned frames")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument(
@@ -433,7 +443,8 @@ def split_episode_ids(episode_ids: Sequence[int], validation_fraction: float,
 
 @torch.inference_mode()
 def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
-                         validation_seed: int) -> float:
+                         validation_seed: int,
+                         max_frames_per_rank: int = 0) -> float:
     """Evaluate deterministic action loss over a finite episode-disjoint split.
 
     The action head still performs its configured repeated diffusion draws. RNG
@@ -455,8 +466,12 @@ def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
         previous_episode = torch.full((1,), -1, dtype=torch.long, device=device)
         action_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
         frame_count = torch.zeros((), dtype=torch.float64, device=device)
+        processed_frames = 0
 
         for batch in loader:
+            if (max_frames_per_rank > 0
+                    and processed_frames >= max_frames_per_rank):
+                break
             if batch["action"].shape[0] != 1:
                 raise ValueError("validation loader must use batch_size=1")
             episode_id = batch["episode_id"].to(device)
@@ -473,12 +488,16 @@ def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
             loss_dict, memory = raw_model(batch, memory)
             action_loss_sum += loss_dict["action"].detach().double()
             frame_count += 1.0
+            processed_frames += 1
 
         stats = torch.stack([action_loss_sum, frame_count])
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         if stats[1].item() <= 0:
-            raise RuntimeError("validation split yielded no frames across all ranks")
+            raise RuntimeError(
+                "validation split yielded no frames across all ranks; "
+                "increase validation.max_episodes or check the dataset"
+            )
         return float((stats[0] / stats[1]).item())
     finally:
         torch.set_rng_state(cpu_rng_state)
@@ -566,11 +585,24 @@ def main():
         0.0, float(trainer_cfg.get("best_checkpoint_min_delta", 0.0))
     )
     validation_cfg = cfg.get("validation", {})
+    if args.validation_enabled is not None:
+        validation_cfg.enabled = bool(args.validation_enabled)
+    if args.validation_interval is not None:
+        validation_cfg.interval_steps = int(args.validation_interval)
+    if args.validation_max_episodes is not None:
+        validation_cfg.max_episodes = int(args.validation_max_episodes)
+    if args.validation_max_frames is not None:
+        validation_cfg.max_frames_per_rank = int(args.validation_max_frames)
     validation_enabled = bool(validation_cfg.get("enabled", False))
     validation_interval = max(1, int(validation_cfg.get("interval_steps", 1000)))
     validation_fraction = float(validation_cfg.get("fraction", 0.1))
     validation_seed = int(validation_cfg.get("seed", 100003))
     validation_max_episodes = int(validation_cfg.get("max_episodes", 0))
+    validation_max_frames = int(
+        validation_cfg.get("max_frames_per_rank", 0)
+    )
+    if validation_max_episodes < 0 or validation_max_frames < 0:
+        raise ValueError("validation episode/frame limits cannot be negative")
 
     # TBPTT window
     tbptt_cfg = cfg.get("tbptt", {})
@@ -742,6 +774,11 @@ def main():
             f"validation={len(validation_episode_ids)} "
             f"(fraction={validation_fraction:g})"
         )
+        if validation_enabled:
+            rank0_print(
+                f"[val] interval={validation_interval} updates, "
+                f"max_frames_per_rank={validation_max_frames or 'all'}"
+            )
     data_iter = iter(loader)
 
     # ── TBPTT state (per-rank, no cross-rank coupling) ──
@@ -927,6 +964,7 @@ def main():
                 device,
                 rank,
                 validation_seed,
+                max_frames_per_rank=validation_max_frames,
             )
             rank0_print(
                 f"[val] step {step+1}/{max_steps} "

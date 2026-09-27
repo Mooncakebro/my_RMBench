@@ -148,9 +148,10 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
 #   - save_every_steps=0 disables additional numbered full checkpoints
 #   - best_checkpoint_min_delta can reduce noisy/repeated best saves
 #   - validation uses 10% held-out episodes, no color jitter, and action loss
-#     only (not COMPACT auxiliary losses); change `validation:` in the config
-#     to control fraction/interval/seed, or set enabled=false to fall back to
-#     training-loss selection
+#     only (not COMPACT auxiliary losses); it is bounded to 256 frames per rank
+#     by default so distributed ranks cannot wait indefinitely at NCCL reduce.
+#     Set `validation.max_frames_per_rank: 0` for a full pass, or pass
+#     `--validation-enabled 0` to fall back to training-loss selection.
 #   - both files are full resume checkpoints (model + optimizer + scheduler)
 #
 # 8-GPU M(1)-mix Compact run:
