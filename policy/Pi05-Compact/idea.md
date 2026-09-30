@@ -40,8 +40,11 @@ Sibling references (read them first; reuse their code per §8):
    (`source/training/train_compact.py`): frames in episode order, memory threaded
    across frames, one backward per K-frame window, detach at window boundaries,
    per-slot episode reset via `episode_id` change. NOT i.i.d. frame sampling.
-5. **Data: RMBench LeRobot v3.0 datasets** (already converted; on the server;
-   local copies at `policy/Mem0-Compact/lerobot_datasets/<task>/`).
+5. **Data: convert the RAW RMBench dataset on this local PC**
+   (`/media/spc/新加卷/RMBench_dataset/data`) into **LeRobot v3.0** format,
+   stored inside the policy directory at `policy/Pi05-Compact/lerobot_datasets/
+   <task>/` — mirroring Mem0-Compact's conversion but adapted to π0.5's needs
+   (3 real cameras, see §4.0). **This conversion is NEW CODE** (§4.0).
 6. **Warm start from official `pi05_base`** weights (see §6). Zero-init injection
    means the wrapped model is exactly π0.5 at init.
 7. **Training recipe aligned with Mem0-Compact**: DDP with episode sharding,
@@ -190,32 +193,91 @@ the pi05 prompt format and adaRMS time conditioning. The only changes:
 
 ## 4. Data
 
-### 4.1 Source
+### 4.0 Raw → LeRobot v3.0 conversion (NEW CODE — must be written)
 
-RMBench LeRobot v3.0 datasets on the server (local reference:
-`policy/Mem0-Compact/lerobot_datasets/<task>/`). 12 tasks; `put_back_block`,
+**The raw dataset lives on this local PC** at
+`/media/spc/新加卷/RMBench_dataset/data/<task>/`, 12 tasks, each with
+`demo_clean/` (50 episodes) and — for `put_back_block`, `swap_blocks`,
+`cover_blocks`, `place_block_mat` — additionally `demo_clean_200/` (200 more
+episodes, appended with `episode_id` offset 50, 250 total).
+
+A new conversion script `policy/Pi05-Compact/scripts/hdf5_to_lerobot.py` must be
+written, modeled on `policy/Mem0-Compact/scripts/hdf5_to_lerobot/M1_dataset_to_lerobot.py`
+and `Mn_dataset_to_lerobot.py` (copy and adapt; support `--task`, `--episodes`,
+`--demo-root demo_clean|demo_clean_200`, `--episode-id-offset`, `--append`),
+with the π0.5-specific changes listed below. Output root:
+`policy/Pi05-Compact/lerobot_datasets/<task>/`.
+
+**Raw HDF5 schema** (verified on `swap_blocks/demo_clean/data/episode0.hdf5`,
+622 frames):
+- `joint_action/left_arm` (T,6), `left_gripper` (T,), `right_arm` (T,6),
+  `right_gripper` (T,), `joint_action/vector` (T,14) — float64
+- `observation/{front,head,left,right}_camera/rgb` (T,) JPEG byte strings
+  (decode via `cv2.imdecode` + BGR→RGB, 240×320×3); all four are **distinct
+  real views** (verified by frame md5); plus camera intrinsics/extrinsics
+  (not needed).
+- `language_annotation.json` in each demo root (M(n) tasks): per episode a list
+  of `[subtask_text, end_frame]`; M(1) tasks use one fixed global instruction
+  (copy the `TASK_INSTRUCTIONS` table from Mem0-Compact's M1 script).
+- `instructions/episode*.json` and `video/episode*.mp4` also exist (reference).
+
+**Conventions to preserve from the Mem0-Compact converter** (so downstream
+code and norm stats stay comparable):
+- 16-dim packing: `state/action = [left_arm(6), 0.0, right_arm(6), 0.0,
+  left_gripper, right_gripper]` (zeros are placeholder joints — keep them so
+  dims line up with Mem0-Compact/Mem-0 stats).
+- `action[t] = state[t+1]` (next-frame state as action; last frame repeats).
+- `subtask_end=1` within the last 8 frames of a subtask segment/episode.
+- `fps=30`, `use_videos=True`, LeRobot **v3.0** (`codebase_version: v3.0`),
+  `task` frame field required; `episode_id` offset when appending
+  `demo_clean_200`.
+
+**π0.5-specific changes vs the Mem0-Compact converter** (the reason new code
+is needed):
+1. **Three real cameras**: add `observation.image.left_camera` and
+   `observation.image.right_camera` video features (head/left/right; drop
+   `front_camera`). π0.5 trains best with all three viewpoints; the eval env
+   also provides exactly these three (§7).
+2. Add a `global_task` string feature for M(1) tasks too (the Mn converter
+   already has it) so the training transform can uniformly read the prompt.
+3. Do NOT copy Mem0-Compact's min/max norm stats — π0.5 uses **quantile
+   (q01/q99) normalization**; the norm-stats script in §8 must emit
+   openpi-format `norm_stats.json` (keys `state`/`actions`, fields
+   `mean`/`std`/`q01`/`q99`, cf. `/home/spc/openpi/src/openpi/shared/
+   normalize.py` and `scripts/compute_norm_stats.py`).
+
+**Conversion validation**: after converting `swap_blocks`, load episode 0 with
+`LeRobotDataset`, print `meta/info.json` features, and visually dump 3 frames
+per camera; total frames must match the raw HDF5 lengths; then convert all 12
+tasks (a `convert_all.sh` mirroring Mem0-Compact's, with `EPISODES=50
+EPISODES_200=200` env knobs).
+
+### 4.1 Converted dataset (target layout)
+
+`policy/Pi05-Compact/lerobot_datasets/<task>/` — 12 tasks; `put_back_block`,
 `swap_blocks`, `cover_blocks`, `place_block_mat` have 250 episodes (50 + 200
-appended), the rest 50. Verified features (e.g. `swap_blocks/meta/info.json`):
+appended), the rest 50. Features:
 
 | key | dtype | shape |
 |---|---|---|
 | `observation.state` | float32 | [16] |
 | `action` | float32 | [16] |
 | `observation.image.head_camera` | video | [240, 320, 3] |
+| `observation.image.left_camera` | video | [240, 320, 3] |
+| `observation.image.right_camera` | video | [240, 320, 3] |
 | `subtask`, `global_task` | string | [1] |
 | `subtask_end` | int32 | [1] |
 | `episode_id`, `episode_index`, `frame_index`, `timestamp` | — | [1] |
 
-fps=30. **The dataset has only the head camera**; the eval env additionally
-provides left/right wrist cameras (see §7). Training therefore uses 1 real
-camera + 2 masked-out cameras.
+fps=30. All three cameras are real — **no camera masking needed** (unlike the
+Mem0-Compact head-only datasets).
 
 ### 4.2 Transform to π0.5 Observation
 
 Per frame (before batching):
-- `head_camera` → `base_0_rgb`; `left_wrist_0_rgb`/`right_wrist_0_rgb` ← zero
-  image with `image_mask=False` (openpi convention; `model.py` requires all
-  three keys). Resize with letterbox pad to 224×224.
+- `head_camera` → `base_0_rgb`, `left_camera` → `left_wrist_0_rgb`,
+  `right_camera` → `right_wrist_0_rgb` (all real, `image_mask=True`).
+  Resize with letterbox pad to 224×224.
 - `state`: 16-dim → quantile-normalized (q01/q99 per task, openpi pi05
   convention) → zero-padded to 32.
 - `actions`: chunk of `action_horizon` future frames via LeRobot
@@ -226,9 +288,11 @@ Per frame (before batching):
   text. pi05 tokenizer format with `discrete_state_input=True`
   (warm-start consistency: pi05_base was trained with the state serialized in
   the prompt), `max_token_len=200`.
-- Norm stats: compute per task over train episodes (q01/q99), saved under
-  `policy/Pi05-Compact/assets/<task>/norm_stats.json`
-  (mirror `policy/Mem0-Compact/scripts/gen_norm_stats.py`).
+- Norm stats: compute per task over train episodes in **openpi quantile
+  format** (`mean`/`std`/`q01`/`q99`, keys `state` and `actions`), saved under
+  `policy/Pi05-Compact/assets/<task>/norm_stats.json` — new script
+  `scripts/gen_norm_stats_pi05.py` (§4.0 item 3; do NOT reuse Mem0-Compact's
+  min/max stats).
 
 ### 4.3 Sequence-aware loading
 
@@ -281,21 +345,79 @@ already DDP-correct). Keep its loop structure verbatim; swap the model/loss:
   Debug: `--window-size 1 --grad-accum-windows 1 --max-steps 100`.
   Server command (8×A800):
   ```bash
-  torchrun --nproc_per_node=8 source/training/train_pi05_compact.py \
+  torchrun --nproc_per_node=8 source/training/train_compact.py \
       --task swap_blocks --batch-size 1 --window-size 8 \
       --grad-accum-windows 7 --max-steps 30000
   ```
 
 ## 6. Warm start from official pi05_base (hard requirement)
 
-1. Download the official checkpoint (openpi asset):
-   `gs://openpi-assets/checkpoints/pi05_base` (via `openpi.shared.download`).
-2. Convert JAX → PyTorch with the repo's official converter:
+1. The official checkpoint is already downloaded **on this local PC** at
+   `~/.cache/openpi/openpi-assets/checkpoints/pi05_base` (orbax layout,
+   `params/ocdbt.process_0` ≈ 12.4 GB + `assets/`; fetched from the public
+   bucket `gs://openpi-assets/checkpoints/pi05_base` — if a re-download is ever
+   needed: browser URL `https://console.cloud.google.com/storage/browser/
+   openpi-assets/checkpoints/pi05_base`, or plain-HTTPS
+   `https://storage.googleapis.com/openpi-assets/checkpoints/pi05_base/<file>`
+   since the bucket is public).
+2. A self-contained copy is stored at
+   `policy/Pi05-Compact/checkpoints/pi05_base`. Convert JAX → PyTorch with the
+   included wrapper around the official converter. The wrapper deliberately
+   uses the official hyphenated flags (`--checkpoint-dir`, `--config-name`,
+   `--output-path`) and defaults to the `pi05_libero` architecture:
    ```bash
-   python /home/spc/openpi/examples/convert_jax_model_to_pytorch.py \
-       --checkpoint_dir ~/.cache/openpi/openpi-assets/checkpoints/pi05_base \
-       --output_path  ~/.cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch
+   REPO_ROOT="$(pwd)"
+   POLICY_ROOT="$REPO_ROOT/policy/Pi05-Compact"
+   CHECKPOINT_DIR="$POLICY_ROOT/checkpoints/pi05_base"
+   OUTPUT_DIR="$POLICY_ROOT/checkpoints/pi05_base_pytorch"
+   OPENPI_PYTHON="/home/spc/openpi/.venv/bin/python"
+   OPENPI_CONVERTER="/home/spc/openpi/examples/convert_jax_model_to_pytorch.py"
+   OPENPI_CONFIG_NAME="pi05_libero"
+   OPENPI_PRECISION="bfloat16"
+   OPENPI_PYTHON="$OPENPI_PYTHON" \
+   OPENPI_CONVERTER="$OPENPI_CONVERTER" \
+   OPENPI_CONFIG_NAME="$OPENPI_CONFIG_NAME" \
+   OPENPI_PRECISION="$OPENPI_PRECISION" \
+     bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
+     2>&1 | tee "$REPO_ROOT/convert_pi05_base.log"
    ```
+   Before conversion, validate an archive (when the source is a `.zip`) and
+   inspect the extracted Orbax markers:
+   ```bash
+   unzip -tq ckpts/pi05_base.zip
+   unzip -l ckpts/pi05_base.zip | sed -n '1,220p'
+   find "$CHECKPOINT_DIR" -maxdepth 2 -type f | sort
+   ```
+   After conversion, enforce the hard gates on the artifact and action head:
+   ```bash
+   test -s "$OUTPUT_DIR/model.safetensors"
+   "$OPENPI_PYTHON" - <<'PY'
+   from pathlib import Path
+   from safetensors.torch import load_file
+   p = Path("policy/Pi05-Compact/checkpoints/pi05_base_pytorch/model.safetensors")
+   state = load_file(str(p), device="cpu")
+   print("keys:", len(state), "size_bytes:", p.stat().st_size)
+   for name in ("action_in_proj.weight", "action_out_proj.weight"):
+       if name not in state:
+           raise SystemExit(f"missing required key: {name}")
+       print(name, tuple(state[name].shape))
+   assert tuple(state["action_in_proj.weight"].shape) == (1024, 32)
+   assert tuple(state["action_out_proj.weight"].shape) == (32, 1024)
+   assert len(state) >= 800, "unexpectedly small converted state dict"
+   PY
+   ```
+   The expected converted directory contains `model.safetensors`,
+   `config.json`, and `assets/`. The key-count and shape checks catch an
+   incomplete conversion before a long training run.
+   `pi05_libero` is an OpenPI **conversion/model config name**, not a claim
+   that this policy trains on LIBERO. Its official data transform sets
+   `discrete_state_input=False` because LIBERO prompts omit robot state. That
+   setting does not get baked into the weights. Our RMBench collate path calls
+   `PaligemmaTokenizer.tokenize(prompt, state)` explicitly, so normalized
+   16-D RMBench state is still encoded as π0.5 discrete state tokens during
+   training and evaluation. `pi05_libero` reports `action_horizon=10` in its
+   conversion config; that value only describes the export wrapper. This
+   policy's RMBench YAML intentionally uses horizon 50 at training time.
 3. Load the converted state dict into `PI0Pytorch` inside `Pi05CompactModel`;
    side memories + action encoder initialize fresh. Because `delta_up` is
    zero-init (§2.2), the wrapped model is **numerically identical to pi05_base
@@ -314,7 +436,13 @@ observation)`, `reset_model(model)`.
 
 - Observation encoding (env side): `observation["observation"]["head_camera"]
   ["rgb"]`, `["right_camera"]["rgb"]`, `["left_camera"]["rgb"]` (all three real
-  at eval), `state = observation["joint_action"]["vector"]` (16-dim).
+  at eval), state from `observation["joint_action"]["vector"]`. **Caveat:** the
+  raw env vector is 14-dim (`left_arm 6 + left_gripper 1 + right_arm 6 +
+  right_gripper 1`) while training uses the 16-dim packing with two zero
+  placeholder joints (§4.0) — the deploy code must pack to 16-dim exactly like
+  the converter (`[left_arm, 0, right_arm, 0, left_gripper, right_gripper]`)
+  and un-pack model outputs back to 14-dim for `TASK_ENV.take_action`. Verify
+  the env's actual state dim on first connection and assert.
 - The model object holds the memory state; `reset_model` clears it
   (episode start only).
 - **Memory cadence at eval (default, mirroring Mem0-Compact's agent):** every
@@ -352,8 +480,15 @@ policy/Pi05-Compact/
 │   ├── training/train_pi05_compact.py  # adapted from Mem0-Compact train_compact.py
 │   └── config/pi05_compact_train.yaml  # mirrors mem0_compact_train.yaml structure
 ├── scripts/
+│   ├── hdf5_to_lerobot.py           # §4.0 RAW → LeRobot v3.0 conversion (NEW CODE;
+│   │                                #   adapted from Mem0-Compact's M1/Mn converters,
+│   │                                #   3-camera features, M1+Mn in one script)
+│   ├── convert_all.sh               #   batch-convert all 12 tasks (EPISODES=50,
+│   │                                #   EPISODES_200=200, append with episode_id offset)
 │   ├── convert_pi05_base.sh         # §6 warm-start conversion
-│   └── gen_norm_stats.py            # per-task q01/q99 stats → assets/<task>/
+│   └── gen_norm_stats_pi05.py       # per-task openpi-format q01/q99 stats
+│                                    #   → assets/<task>/norm_stats.json (NOT min/max)
+├── lerobot_datasets/<task>/         # §4.0 conversion output (12 tasks, local PC)
 ├── assets/<task>/norm_stats.json
 ├── deploy_policy.py / deploy_policy.yml / eval.sh
 └── debug/                           # smoke_forward / tbptt_check / parity_check / test_deploy
@@ -366,6 +501,11 @@ policy/Pi05-Compact/
 
 ## 9. Verification plan (mirrors Mem0-Compact §6)
 
+0. **Data conversion** (§4.0): convert `swap_blocks` first; `LeRobotDataset`
+   reloads it, `meta/info.json` shows the 3-camera features, frame counts match
+   the raw HDF5, 3 frames per camera visually dumped and checked; norm stats
+   JSON has `mean`/`std`/`q01`/`q99` for `state` and `actions` with dim 16.
+   Then `convert_all.sh` for all 12 tasks.
 1. **Smoke test**: model builds; forward/backward on a synthetic batch; memory
    state shapes `M [B,16,128] × 18`, `P [B,16] × 18`, `e [B] × 18`; aux losses
    finite; zero-init check (`debug/smoke_forward.py`, cf. JAMEL-COMPACT
@@ -401,3 +541,136 @@ policy/Pi05-Compact/
 - Whether observation extraction should pool only image tokens (current
   default: image + language, matching COMPACT) — ablate.
 - Per-frame vs per-chunk memory cadence at eval (§7) — ablate after v1 works.
+
+## 11. Reproducible commands
+
+Run all commands from the RMBench repository root unless the command changes
+directory explicitly.
+
+### 11.1 Copy and convert the official π0.5 checkpoint
+
+The Orbax checkpoint has already been copied into this policy directory. To
+repeat the copy and produce the PyTorch checkpoint:
+
+```bash
+REPO_ROOT="$(pwd)"
+POLICY_ROOT="$REPO_ROOT/policy/Pi05-Compact"
+mkdir -p "$POLICY_ROOT/checkpoints"
+if [[ ! -d "$POLICY_ROOT/checkpoints/pi05_base" ]]; then
+  cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi05_base \
+    "$POLICY_ROOT/checkpoints/"
+fi
+CHECKPOINT_DIR="$POLICY_ROOT/checkpoints/pi05_base"
+find "$CHECKPOINT_DIR" -maxdepth 2 -type f | sort
+OPENPI_PYTHON="/home/spc/openpi/.venv/bin/python" \
+OPENPI_CONVERTER="/home/spc/openpi/examples/convert_jax_model_to_pytorch.py" \
+OPENPI_CONFIG_NAME="pi05_libero" OPENPI_PRECISION="bfloat16" \
+  bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
+  2>&1 | tee "$REPO_ROOT/convert_pi05_base.log"
+test -s "$POLICY_ROOT/checkpoints/pi05_base_pytorch/model.safetensors"
+```
+
+### 11.2 Convert RMBench data and generate quantile statistics
+
+```bash
+LD_LIBRARY_PATH=/home/spc/anaconda3/envs/lerobot/lib \
+  conda run -n lerobot bash policy/Pi05-Compact/scripts/convert_all.sh
+
+for task_dir in policy/Pi05-Compact/lerobot_datasets/*; do
+  task="$(basename "$task_dir")"
+  LD_LIBRARY_PATH=/home/spc/anaconda3/envs/lerobot/lib \
+    conda run -n lerobot python policy/Pi05-Compact/scripts/gen_norm_stats_pi05.py \
+      "$task_dir" \
+      --output "policy/Pi05-Compact/assets/$task/norm_stats.json"
+done
+```
+
+For a short converter check, override the episode counts:
+
+```bash
+EPISODES=1 EPISODES_200=1 \
+LD_LIBRARY_PATH=/home/spc/anaconda3/envs/lerobot/lib \
+  conda run -n lerobot bash policy/Pi05-Compact/scripts/convert_all.sh
+```
+
+### 11.3 Train
+
+The trainer accepts explicit overrides for the values that commonly change
+between a local smoke test and an 8-GPU run. `--freeze-base` is opt-in;
+omitting it leaves the base trainable as specified by the YAML. The command
+below is intentionally written in the same environment-variable style as the
+Mem0-Compact baseline:
+
+```bash
+REPO_ROOT="$(pwd)"
+POLICY_ROOT="$REPO_ROOT/policy/Pi05-Compact"
+CONFIG="$POLICY_ROOT/source/config/pi05_compact_train.yaml"
+TASK="swap_blocks"
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+NPROC=8
+MASTER_PORT=29511
+BATCH_SIZE=1
+MAX_STEPS=30000
+FREEZE_BASE=0
+WINDOW_SIZE=8
+GRAD_ACCUM_WINDOWS=7
+NUM_WORKERS=2
+BASE_CHECKPOINT="$POLICY_ROOT/checkpoints/pi05_base_pytorch"
+OUTPUT_DIR="$POLICY_ROOT/runs/pi05_compact_${TASK}"
+
+TRAIN_FLAGS=(
+  --config "$CONFIG"
+  --task "$TASK"
+  --base-checkpoint "$BASE_CHECKPOINT"
+  --batch-size "$BATCH_SIZE"
+  --window-size "$WINDOW_SIZE"
+  --grad-accum-windows "$GRAD_ACCUM_WINDOWS"
+  --num-workers "$NUM_WORKERS"
+  --max-steps "$MAX_STEPS"
+  --output-dir "$OUTPUT_DIR"
+)
+if [[ "$FREEZE_BASE" == 1 ]]; then TRAIN_FLAGS+=(--freeze-base); fi
+
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+  torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" \
+  "$POLICY_ROOT/source/training/train_compact.py" "${TRAIN_FLAGS[@]}" \
+  2>&1 | tee "$REPO_ROOT/train_pi05_compact_${TASK}.log"
+```
+
+For a local one-GPU smoke test, keep the same command and set
+`CUDA_VISIBLE_DEVICES=0`, `NPROC=1`, `BATCH_SIZE=1`,
+`GRAD_ACCUM_WINDOWS=1`, `NUM_WORKERS=0`, `MAX_STEPS=100`, and
+`OUTPUT_DIR="$POLICY_ROOT/runs/smoke_${TASK}"`. The trainer always writes
+`ckpt_final.pt` to the selected output directory; validation-based
+`ckpt_best.pt` is not implemented in this first self-contained trainer.
+
+### 11.4 Evaluate in RMBench
+
+```bash
+REPO_ROOT="$(pwd)"
+TASK_NAME="swap_blocks"
+TASK_CONFIG="demo_clean"
+DEVICE="cuda"
+CHECKPOINT="$REPO_ROOT/policy/Pi05-Compact/runs/pi05_compact_${TASK_NAME}/ckpt_final.pt"
+NORM_STATS="$REPO_ROOT/policy/Pi05-Compact/assets/${TASK_NAME}/norm_stats.json"
+GLOBAL_TASK="There are three trays on the table, and two blocks are placed in two different trays. Swap the positions of the two blocks. Finally press the button."
+CUDA_VISIBLE_DEVICES="0" \
+  CHECKPOINT="$CHECKPOINT" TASK_NAME="$TASK_NAME" TASK_CONFIG="$TASK_CONFIG" \
+  DEVICE="$DEVICE" NORM_STATS="$NORM_STATS" GLOBAL_TASK="$GLOBAL_TASK" \
+  bash "$REPO_ROOT/policy/Pi05-Compact/eval.sh" \
+  2>&1 | tee "$REPO_ROOT/eval_pi05_compact_${TASK_NAME}.log"
+```
+
+Equivalent direct invocation, useful when passing harness overrides:
+
+```bash
+python script/eval_policy.py \
+  --config policy/Pi05-Compact/deploy_policy.yml --overrides \
+  --task_name swap_blocks \
+  --task_config demo_clean \
+  --ckpt_setting pi05_compact \
+  --model_config policy/Pi05-Compact/source/config/pi05_compact_train.yaml \
+  --checkpoint policy/Pi05-Compact/checkpoints/pi05_compact/ckpt_final.pt \
+  --norm_stats policy/Pi05-Compact/assets/swap_blocks/norm_stats.json \
+  --device cuda
+```

@@ -1,0 +1,12 @@
+policy_name: Pi05-Compact
+task_name: swap_blocks
+task_config: demo_clean
+ckpt_setting: pi05_compact
+seed: 0
+instruction_type: unseen
+device: cuda
+model_config: policy/Pi05-Compact/source/config/pi05_compact_train.yaml
+checkpoint: policy/Pi05-Compact/checkpoints/pi05_compact/ckpt_final.pt
+norm_stats: policy/Pi05-Compact/assets/swap_blocks/norm_stats.json
+global_task: "There are three trays on the table, and two blocks are placed in two different trays. Swap the positions of the two blocks. Finally press the button."
+action_execute_steps: 1

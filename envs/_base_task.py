@@ -1062,13 +1062,23 @@ class Base_Task(gym.Env):
         pose_num = len(target_lst)
         traj_lst = plan_multi_pose(target_lst)
         now_pose = None
-        now_step = -1
+        now_step = None
         for i in range(pose_num):
             if traj_lst["status"][i] != "Success":
                 continue
-            if now_pose is None or len(traj_lst["position"][i]) < now_step:
+            trajectory = traj_lst.get("position", [None] * pose_num)[i]
+            trajectory_steps = len(trajectory) if trajectory is not None else None
+            if now_pose is None or (
+                trajectory_steps is not None and (now_step is None or trajectory_steps < now_step)
+            ):
                 now_pose = target_lst[i]
-        return now_pose
+                now_step = trajectory_steps
+
+        # Batch planning can fail transiently (or be unavailable for a
+        # particular planner) even when the nominal geometric grasp is valid.
+        # Keep a concrete pose so the normal single-pose move planner can make
+        # the final decision instead of leaking None into Action.
+        return res_pose if now_pose is None else now_pose
 
     # test grasp pose of all contact points
     def _print_all_grasp_pose_of_contact_points(self, actor: Actor, pre_dis: float = 0.1):
@@ -1247,6 +1257,11 @@ class Base_Task(gym.Env):
             target_dis=grasp_dis,
             contact_point_id=contact_point_id,
         )
+        if pre_grasp_pose is None or grasp_pose is None:
+            # A failed grasp-plan must stop the episode through the existing
+            # plan_success path; Action rejects None target poses by design.
+            self.plan_success = False
+            return arm_tag, []
         if pre_grasp_pose == grasp_pose:
             return arm_tag, [
                 Action(arm_tag, "move", target_pose=pre_grasp_pose),

@@ -1,0 +1,33 @@
+model:
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  pi05: true
+  dtype: bfloat16
+  action_dim: 32
+  action_horizon: 50
+  max_token_len: 200
+compact:
+  mem_dim: 128
+  num_mem_tokens: 16
+  num_heads: 8
+  num_obs_tokens: 4
+  freeze_base: false
+  lambda_obs: 0.01
+  lambda_nll: 0.01
+  lambda_mem: 0.001
+  base_checkpoint: checkpoints/pi05_base_pytorch
+data:
+  root: lerobot_datasets/swap_blocks
+  norm_stats: assets/swap_blocks/norm_stats.json
+  batch_size: 1
+  num_workers: 0
+training:
+  max_steps: 30000
+  window_size: 8
+  grad_accum_windows: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_grad_norm: 1.0
+  output_dir: checkpoints/pi05_compact
+  log_interval: 10

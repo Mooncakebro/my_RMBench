@@ -1,0 +1,2 @@
+BOLD = "\033[1m"
+RESET_BOLD = "\033[0m"
