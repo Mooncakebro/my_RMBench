@@ -370,15 +370,18 @@ already DDP-correct). Keep its loop structure verbatim; swap the model/loss:
    POLICY_ROOT="$REPO_ROOT/policy/Pi05-Compact"
    CHECKPOINT_DIR="$POLICY_ROOT/checkpoints/pi05_base"
    OUTPUT_DIR="$POLICY_ROOT/checkpoints/pi05_base_pytorch"
-   OPENPI_PYTHON="/home/spc/openpi/.venv/bin/python"
-   OPENPI_CONVERTER="/home/spc/openpi/examples/convert_jax_model_to_pytorch.py"
+   OPENPI_ROOT="${OPENPI_ROOT:-$HOME/storage/openpi}"
+   OPENPI_PYTHON="$OPENPI_ROOT/.venv/bin/python"
+   OPENPI_CONVERTER="$OPENPI_ROOT/examples/convert_jax_model_to_pytorch.py"
+   OPENPI_SRC="$OPENPI_ROOT/src"
    OPENPI_CONFIG_NAME="pi05_libero"
    OPENPI_PRECISION="bfloat16"
    OPENPI_PYTHON="$OPENPI_PYTHON" \
    OPENPI_CONVERTER="$OPENPI_CONVERTER" \
+   OPENPI_SRC="$OPENPI_SRC" \
    OPENPI_CONFIG_NAME="$OPENPI_CONFIG_NAME" \
    OPENPI_PRECISION="$OPENPI_PRECISION" \
-     bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
+     /bin/bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
      2>&1 | tee "$REPO_ROOT/convert_pi05_base.log"
    ```
    Before conversion, validate an archive (when the source is a `.zip`) and
@@ -562,10 +565,12 @@ if [[ ! -d "$POLICY_ROOT/checkpoints/pi05_base" ]]; then
 fi
 CHECKPOINT_DIR="$POLICY_ROOT/checkpoints/pi05_base"
 find "$CHECKPOINT_DIR" -maxdepth 2 -type f | sort
-OPENPI_PYTHON="/home/spc/openpi/.venv/bin/python" \
-OPENPI_CONVERTER="/home/spc/openpi/examples/convert_jax_model_to_pytorch.py" \
+OPENPI_ROOT="${OPENPI_ROOT:-$HOME/storage/openpi}"
+OPENPI_PYTHON="$OPENPI_ROOT/.venv/bin/python" \
+OPENPI_CONVERTER="$OPENPI_ROOT/examples/convert_jax_model_to_pytorch.py" \
+OPENPI_SRC="$OPENPI_ROOT/src" \
 OPENPI_CONFIG_NAME="pi05_libero" OPENPI_PRECISION="bfloat16" \
-  bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
+  /bin/bash "$POLICY_ROOT/scripts/convert_pi05_base.sh" \
   2>&1 | tee "$REPO_ROOT/convert_pi05_base.log"
 test -s "$POLICY_ROOT/checkpoints/pi05_base_pytorch/model.safetensors"
 ```

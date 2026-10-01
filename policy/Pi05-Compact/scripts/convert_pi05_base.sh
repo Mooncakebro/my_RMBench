@@ -4,9 +4,10 @@ set -euo pipefail
 POLICY_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CHECKPOINT_DIR="${PI05_BASE_CHECKPOINT:-$POLICY_DIR/checkpoints/pi05_base}"
 OUTPUT_DIR="${PI05_BASE_PYTORCH_OUTPUT:-$POLICY_DIR/checkpoints/pi05_base_pytorch}"
-CONVERTER="${OPENPI_CONVERTER:-/home/spc/openpi/examples/convert_jax_model_to_pytorch.py}"
-PYTHON_BIN="${OPENPI_PYTHON:-/home/spc/openpi/.venv/bin/python}"
-OPENPI_SRC="${OPENPI_SRC:-/home/spc/openpi/src}"
+OPENPI_ROOT="${OPENPI_ROOT:-/home/spc/openpi}"
+CONVERTER="${OPENPI_CONVERTER:-$OPENPI_ROOT/examples/convert_jax_model_to_pytorch.py}"
+PYTHON_BIN="${OPENPI_PYTHON:-$OPENPI_ROOT/.venv/bin/python}"
+OPENPI_SRC="${OPENPI_SRC:-$OPENPI_ROOT/src}"
 
 if [[ ! -d "$CHECKPOINT_DIR" ]]; then
   echo "missing Orbax checkpoint: $CHECKPOINT_DIR" >&2
