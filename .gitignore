@@ -1,4 +1,10 @@
 models/
+!policy/Pi05-Compact/source/models/
+!policy/Pi05-Compact/source/models/**
+!policy/Pi05-Compact/vendor/openpi_torch/openpi/models/
+!policy/Pi05-Compact/vendor/openpi_torch/openpi/models/**
+!policy/Pi05-Compact/vendor/openpi_torch/openpi/models_pytorch/transformers_replace/models/
+!policy/Pi05-Compact/vendor/openpi_torch/openpi/models_pytorch/transformers_replace/models/**
 !policy/Mem-0/source/models
 !policy/CompactMoDE/vendor/mode/models/
 !policy/CompactMoDE/vendor/mode/models/**
@@ -44,3 +50,6 @@ policy/Mem0-Compact/runs/
 _tmp_visual/
 *.log
 policy/Pi05-Compact/lerobot_datasets/
+# !policy/Pi05-Compact/assets/
+# !policy/Pi05-Compact/assets/**/
+# !policy/Pi05-Compact/assets/**/*.json
