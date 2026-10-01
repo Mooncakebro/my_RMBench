@@ -20,11 +20,20 @@ from torch.optim import AdamW
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-from source.models.pi05_compact_model import Pi05CompactModel
-from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
-from source.training.ddp_utils import destroy_distributed, get_ddp_device, rank0_print, setup_distributed
+SOURCE_ROOT = ROOT / "source"
+for import_root in (SOURCE_ROOT, ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+try:
+    from source.models.pi05_compact_model import Pi05CompactModel
+    from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
+    from source.training.ddp_utils import destroy_distributed, get_ddp_device, rank0_print, setup_distributed
+except ModuleNotFoundError as exc:
+    if exc.name not in {"source", "source.models", "source.dataloader", "source.training"}:
+        raise
+    from models.pi05_compact_model import Pi05CompactModel
+    from dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
+    from training.ddp_utils import destroy_distributed, get_ddp_device, rank0_print, setup_distributed
 
 
 def _cfg(values):

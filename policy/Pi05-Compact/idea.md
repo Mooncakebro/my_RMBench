@@ -566,6 +566,15 @@ fi
 CHECKPOINT_DIR="$POLICY_ROOT/checkpoints/pi05_base"
 find "$CHECKPOINT_DIR" -maxdepth 2 -type f | sort
 OPENPI_ROOT="${OPENPI_ROOT:-$HOME/storage/openpi}"
+OPENPI_PYTHON="$OPENPI_ROOT/.venv/bin/python"
+TRANSFORMERS_SITE="$($OPENPI_PYTHON -c 'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')"
+"$OPENPI_PYTHON" - <<'PY'
+import transformers
+assert transformers.__version__ == "4.53.2", transformers.__version__
+print("transformers:", transformers.__version__)
+PY
+cp -r "$OPENPI_ROOT/src/openpi/models_pytorch/transformers_replace/"* \
+  "$TRANSFORMERS_SITE/"
 OPENPI_PYTHON="$OPENPI_ROOT/.venv/bin/python" \
 OPENPI_CONVERTER="$OPENPI_ROOT/examples/convert_jax_model_to_pytorch.py" \
 OPENPI_SRC="$OPENPI_ROOT/src" \

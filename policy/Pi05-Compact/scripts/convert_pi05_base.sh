@@ -8,6 +8,7 @@ OPENPI_ROOT="${OPENPI_ROOT:-/home/spc/openpi}"
 CONVERTER="${OPENPI_CONVERTER:-$OPENPI_ROOT/examples/convert_jax_model_to_pytorch.py}"
 PYTHON_BIN="${OPENPI_PYTHON:-$OPENPI_ROOT/.venv/bin/python}"
 OPENPI_SRC="${OPENPI_SRC:-$OPENPI_ROOT/src}"
+OPENPI_CLIENT_SRC="${OPENPI_CLIENT_SRC:-$OPENPI_ROOT/packages/openpi-client/src}"
 
 if [[ ! -d "$CHECKPOINT_DIR" ]]; then
   echo "missing Orbax checkpoint: $CHECKPOINT_DIR" >&2
@@ -22,7 +23,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-PYTHONPATH="$OPENPI_SRC${PYTHONPATH:+:$PYTHONPATH}" \
+PYTHONPATH="$OPENPI_SRC:$OPENPI_CLIENT_SRC${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON_BIN" "$CONVERTER" \
   --checkpoint-dir "$CHECKPOINT_DIR" \
   --config-name "${OPENPI_CONFIG_NAME:-pi05_libero}" \
