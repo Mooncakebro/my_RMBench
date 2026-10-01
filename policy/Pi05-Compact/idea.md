@@ -609,6 +609,34 @@ LD_LIBRARY_PATH=/home/spc/anaconda3/envs/lerobot/lib \
 
 ### 11.3 Train
 
+Before launching DDP, use one repository copy consistently. A mixed
+`PYTHONPATH` can execute `train_compact.py` from one checkout while importing
+`source/models` or vendored OpenPI from another. The preflight below catches
+that and checks the jaxtyping compatibility shim:
+
+```bash
+REPO_ROOT="$(pwd)"
+POLICY_ROOT="$REPO_ROOT/policy/Pi05-Compact"
+OPENPI_ROOT="/mnt/lvm_storage/songyuebing/openpi"
+unset PYTHONPATH
+export PYTHONPATH="$POLICY_ROOT:$POLICY_ROOT/source:$POLICY_ROOT/vendor/openpi_torch:$OPENPI_ROOT/src:$OPENPI_ROOT/packages/openpi-client/src"
+python - <<'PY'
+import source.models.pi05_compact_model as compact
+import openpi.models_pytorch.pi0_pytorch as pi0
+print("compact:", compact.__file__)
+print("openpi:", pi0.__file__)
+PY
+```
+
+The vendored `array_typing.py` tolerates jaxtyping versions where OpenPI's
+private `_check_dataclass_annotations` hook no longer exists. OpenPI itself
+pins `jaxtyping==0.2.36`; pinning that version is also valid if the server
+environment is dedicated to OpenPI:
+
+```bash
+python -m pip install --force-reinstall --no-deps "jaxtyping==0.2.36"
+```
+
 The trainer accepts explicit overrides for the values that commonly change
 between a local smoke test and an 8-GPU run. `--freeze-base` is opt-in;
 omitting it leaves the base trainable as specified by the YAML. The command
@@ -687,4 +715,12 @@ python script/eval_policy.py \
   --checkpoint policy/Pi05-Compact/checkpoints/pi05_compact/ckpt_final.pt \
   --norm_stats policy/Pi05-Compact/assets/swap_blocks/norm_stats.json \
   --device cuda
+```
+
+
+## 12. Python package to install under syb_lerobot
+```bash
+pip install pytest jax beartype jaxtyping
+
+
 ```
