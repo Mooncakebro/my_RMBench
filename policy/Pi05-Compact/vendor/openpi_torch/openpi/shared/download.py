@@ -168,8 +168,12 @@ def _ensure_permissions(path: pathlib.Path) -> None:
 
 def _get_mtime(year: int, month: int, day: int) -> float:
     """Get the mtime of a given date at midnight UTC."""
-    date = datetime.datetime(year, month, day, tzinfo=datetime.UTC)
-    return time.mktime(date.timetuple())
+    # ``datetime.UTC`` is only available on Python 3.11+.  The Pi05
+    # training environment also supports Python 3.10, where ``timezone.utc``
+    # is the portable spelling.  ``timestamp`` preserves the UTC timezone
+    # instead of interpreting the date through the host's local timezone.
+    date = datetime.datetime(year, month, day, tzinfo=datetime.timezone.utc)
+    return date.timestamp()
 
 
 # Map of relative paths, defined as regular expressions, to expiration timestamps (mtime format).
