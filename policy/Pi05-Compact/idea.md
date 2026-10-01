@@ -720,8 +720,8 @@ python script/eval_policy.py \
 
 ## 12. Python package to install under syb_lerobot
 ```bash
-pip install pytest jax beartype "jaxtyping==0.2.36" orbax sentencepiece chex flax
-pip install tqdm_loggable
+pip install pytest jax beartype tqdm_loggable orbax sentencepiece chex flax
+pip install "jaxtyping==0.2.36"
 
 
 

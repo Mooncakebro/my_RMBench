@@ -83,11 +83,13 @@ def _installed_version(spec: str) -> str | None:
 
 
 def _version_matches(spec: str, installed: str | None) -> bool:
-    if installed is None:
-        return False
     constraint = spec[len(_distribution_name(spec)):]
     if not constraint:
+        # Workspace packages such as openpi-client may be importable from a
+        # source checkout without an installed distribution metadata record.
         return True
+    if installed is None:
+        return False
     try:
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version
