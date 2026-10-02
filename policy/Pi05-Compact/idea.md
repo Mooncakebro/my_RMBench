@@ -747,6 +747,10 @@ pip install pytest jax beartype tqdm_loggable orbax sentencepiece chex flax
 pip install "jaxtyping==0.2.36" tyro numpydantic h5py gcsfs
 pip install "gcsfs==2025.3.0"
 
+# Keep the OpenPI Transformers pair compatible. Do not use --no-deps for this
+# repair: transformers 4.53.2 requires tokenizers in the 0.21.x series.
+pip install --force-reinstall "transformers==4.53.2" "tokenizers>=0.21,<0.22"
+
 
 
 ```

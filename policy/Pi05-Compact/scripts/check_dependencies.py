@@ -38,6 +38,8 @@ REQUIREMENTS = (
     Requirement("torch", "torch", "PyTorch model/training"),
     Requirement("yaml", "PyYAML", "training YAML"),
     Requirement("safetensors", "safetensors", "converted checkpoint loading"),
+    # Transformers 4.53.2 refuses to import with tokenizers 0.22.x.
+    Requirement("tokenizers", "tokenizers>=0.21,<0.22", "Transformers 4.53.2 runtime"),
     Requirement("transformers", "transformers==4.53.2", "OpenPI PyTorch model"),
     Requirement("tyro", "tyro>=0.9.5", "OpenPI converter CLI", frozenset({"conversion"})),
     Requirement("jax", "jax", "Orbax/OpenPI checkpoint restore", frozenset({"conversion"})),
