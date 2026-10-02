@@ -38,6 +38,12 @@ from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionCo
 logger = logging.get_logger(__name__)
 
 
+def _layer_norm_preserving_dtype(layer_norm: nn.LayerNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run LayerNorm in parameter dtype and restore the activation dtype."""
+    activation_dtype = hidden_states.dtype
+    return layer_norm(hidden_states.to(dtype=layer_norm.weight.dtype)).to(dtype=activation_dtype)
+
+
 def _trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
@@ -459,7 +465,9 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         """
         residual = hidden_states
 
-        hidden_states = self.layer_norm1(hidden_states)
+        # Transformers may keep LayerNorm parameters in float32 while OpenPI
+        # runs the vision stream in bf16. Preserve the residual stream dtype.
+        hidden_states = _layer_norm_preserving_dtype(self.layer_norm1, hidden_states)
         hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -468,7 +476,7 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = _layer_norm_preserving_dtype(self.layer_norm2, hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -675,7 +683,7 @@ class SiglipTextTransformer(nn.Module):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = _layer_norm_preserving_dtype(self.final_layer_norm, last_hidden_state)
 
         # Assuming "sticky" EOS tokenization, last token is always EOS.
         pooled_output = last_hidden_state[:, -1, :]
@@ -784,7 +792,7 @@ class SiglipVisionTransformer(nn.Module):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.post_layernorm(last_hidden_state)
+        last_hidden_state = _layer_norm_preserving_dtype(self.post_layernorm, last_hidden_state)
 
         pooler_output = self.head(last_hidden_state) if self.use_head else None
 
@@ -814,7 +822,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
 
         residual = hidden_state
-        hidden_state = self.layernorm(hidden_state)
+        hidden_state = _layer_norm_preserving_dtype(self.layernorm, hidden_state)
         hidden_state = residual + self.mlp(hidden_state)
 
         return hidden_state[:, 0]
