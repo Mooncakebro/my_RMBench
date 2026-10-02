@@ -153,8 +153,20 @@ class PI0Pytorch(nn.Module):
             from transformers.models.siglip import check
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
+                if config.dtype == "bfloat16":
+                    raise RuntimeError(
+                        "Pi05 bfloat16 requires OpenPI's transformers_replace patch. "
+                        "Install transformers==4.53.2, then copy "
+                        "openpi/src/openpi/models_pytorch/transformers_replace/* "
+                        "into the active Transformers package."
+                    )
                 logging.warning(msg)
         except ImportError:
+            if config.dtype == "bfloat16":
+                raise RuntimeError(
+                    "Pi05 bfloat16 requires Transformers with OpenPI's "
+                    "transformers_replace patch."
+                )
             logging.warning(msg)
 
     def gradient_checkpointing_enable(self):

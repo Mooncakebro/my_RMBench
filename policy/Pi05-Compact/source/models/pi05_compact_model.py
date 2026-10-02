@@ -115,7 +115,11 @@ class Pi05CompactModel(nn.Module):
 
     def init_memory(self, batch_size: int, device=None) -> Dict[str, list]:
         device = device or next(self.parameters()).device
-        dtype = next(self.base.parameters()).dtype
+        # Memory states are consumed by the side-memory projections.  Do not
+        # infer their dtype from the first base parameter: PaliGemma keeps
+        # selected vision parameters in float32 while the decoder/COMPACT
+        # stream is normally bfloat16.
+        dtype = next(self.side_memories.parameters()).dtype
         memories, variances = [], []
         for sm in self.side_memories:
             memories.append(sm.init_memory[None].expand(batch_size, -1, -1).clone().to(device=device, dtype=dtype))

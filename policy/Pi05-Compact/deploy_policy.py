@@ -7,6 +7,7 @@ at episode boundaries.  Environment actions are 14-D; the model uses the
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,8 @@ from source.models.pi05_compact_model import Pi05CompactModel
 
 
 class Pi05CompactPolicy:
-    def __init__(self, config_path, checkpoint, device=None, instruction="", norm_stats=None):
+    def __init__(self, config_path, checkpoint, device=None, instruction="", norm_stats=None,
+                 tokenizer_path=None):
         values = yaml.safe_load(Path(config_path).read_text())
         cfg = SimpleNamespace(**values["model"], **values.get("compact", {}))
         self.model = Pi05CompactModel(cfg, freeze_base=bool(cfg.freeze_base))
@@ -31,7 +33,10 @@ class Pi05CompactPolicy:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device).eval()
         from openpi.models.tokenizer import PaligemmaTokenizer
-        self.tokenizer = PaligemmaTokenizer(cfg.max_token_len)
+        self.tokenizer = PaligemmaTokenizer(
+            cfg.max_token_len,
+            tokenizer_path or os.environ.get("PALIGEMMA_TOKENIZER_PATH"),
+        )
         self.instruction = instruction
         if norm_stats is None:
             raise ValueError("norm_stats is required for Pi05-Compact deployment")
@@ -80,10 +85,11 @@ class Pi05CompactPolicy:
             token_ar_mask=None, token_loss_mask=None,
         )
         action, self.memory = self.model.sample_actions(obs, self.memory, self.prev_action)
-        # The environment executes the returned chunk before requesting the
-        # next one, so the final chunk action is the next control input.
+        # The RMBench callback executes chunk[0] immediately.  The next
+        # recurrent input must therefore be the action actually executed, not
+        # the final action in the predicted chunk.
         normalized = action[0].cpu().numpy()
-        self.prev_action = torch.from_numpy(normalized[-1].copy())[None].to(self.device)
+        self.prev_action = torch.from_numpy(normalized[0].copy())[None].to(self.device)
         return np.stack([self._unpack(self._unnormalize(x, "actions")) for x in normalized])
 
 
@@ -93,7 +99,8 @@ def get_model(usr_args):
     return Pi05CompactPolicy(config_path, checkpoint,
                              device=usr_args.get("device"),
                              instruction=usr_args.get("global_task", usr_args.get("instruction", "")),
-                             norm_stats=usr_args.get("norm_stats"))
+                             norm_stats=usr_args.get("norm_stats"),
+                             tokenizer_path=usr_args.get("tokenizer_path"))
 
 
 def eval(TASK_ENV, model, observation):
