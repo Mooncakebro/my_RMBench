@@ -70,6 +70,8 @@ def resize_with_pad_torch(
     Returns:
         Resized and padded tensor with same shape format as input
     """
+    input_was_batched = images.dim() == 4
+
     # Check if input is in channels-last format [*b, h, w, c] or channels-first [*b, c, h, w]
     if images.shape[-1] <= 4:  # Assume channels-last format
         channels_last = True
@@ -120,7 +122,7 @@ def resize_with_pad_torch(
     # Convert back to original format if needed
     if channels_last:
         padded_images = padded_images.permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
-        if batch_size == 1 and images.shape[0] == 1:
+        if not input_was_batched:
             padded_images = padded_images.squeeze(0)  # Remove batch dimension if it was added
 
     return padded_images
