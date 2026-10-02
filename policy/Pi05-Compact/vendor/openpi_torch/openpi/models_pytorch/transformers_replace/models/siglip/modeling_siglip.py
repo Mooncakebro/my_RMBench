@@ -283,7 +283,12 @@ class SiglipVisionEmbeddings(nn.Module):
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
-            embeddings = embeddings + self.position_embedding(self.position_ids)
+            # DDP broadcasts module buffers before each forward.  TBPTT keeps
+            # several checkpoint graphs alive across forwards, so retaining
+            # this shared buffer as an embedding index causes its version to
+            # change before backward.  Give each graph private indices.
+            position_ids = self.position_ids[:, : embeddings.shape[1]].clone()
+            embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
 
 
