@@ -56,6 +56,22 @@ def preprocess_observation_pytorch(
     for key in image_keys:
         image = observation.images[key]
 
+        # LeRobot may return a single decoded frame as [C, H, W] or
+        # [H, W, C] when the effective batch size is one.  The rest of this
+        # function operates on batched tensors, so add the missing batch axis
+        # before inspecting the channel layout.  Keep the axis in the output;
+        # the model always consumes batched image tensors.
+        if image.ndim == 3:
+            if image.shape[0] != 3 and image.shape[-1] != 3:
+                raise ValueError(
+                    f"image {key!r} has no RGB channel dimension: shape {tuple(image.shape)}"
+                )
+            image = image.unsqueeze(0)
+        elif image.ndim != 4:
+            raise ValueError(
+                f"image {key!r} must have rank 3 or 4, got shape {tuple(image.shape)}"
+            )
+
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats
         is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1

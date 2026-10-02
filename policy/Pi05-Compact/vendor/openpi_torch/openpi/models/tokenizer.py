@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -12,10 +13,15 @@ import openpi.shared.download as download
 
 
 class PaligemmaTokenizer:
-    def __init__(self, max_len: int = 48):
+    def __init__(self, max_len: int = 48, tokenizer_path: str | Path | None = None):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_path = tokenizer_path or os.environ.get("PALIGEMMA_TOKENIZER_PATH")
+        path = Path(local_path).expanduser() if local_path else download.maybe_download(
+            "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
+        )
+        if not path.is_file():
+            raise FileNotFoundError(f"PaliGemma tokenizer not found: {path}")
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 

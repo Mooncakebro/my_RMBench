@@ -48,6 +48,7 @@ REQUIREMENTS = (
     Requirement("openpi_client", "openpi-client", "OpenPI workspace client", frozenset({"conversion", "training"})),
     Requirement("einops", "einops>=0.8.0", "OpenPI tensor reshaping", frozenset({"conversion", "training"})),
     Requirement("fsspec", "fsspec", "OpenPI checkpoint/filesystem helpers", frozenset({"conversion", "training"})),
+    Requirement("gcsfs", "gcsfs", "OpenPI gs:// tokenizer/assets downloads", frozenset({"conversion", "training"})),
     Requirement("filelock", "filelock", "OpenPI download/cache helpers", frozenset({"conversion", "training"})),
     Requirement("tqdm_loggable", "tqdm-loggable", "OpenPI restore progress", frozenset({"conversion", "training"})),
     Requirement("numpydantic", "numpydantic", "OpenPI normalization types", frozenset({"conversion", "training"})),

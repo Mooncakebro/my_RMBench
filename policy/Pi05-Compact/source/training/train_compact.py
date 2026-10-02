@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -125,6 +126,9 @@ def main():
     parser.add_argument("--grad-accum-windows", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--tokenizer-path", type=Path, default=None,
+                        help="local PaliGemma tokenizer.model; avoids per-rank GCS download")
+    parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--freeze-base", action="store_true", default=None)
     parser.add_argument("--train-base", action="store_true", help="override config and train the base model")
     args = parser.parse_args()
@@ -139,6 +143,8 @@ def main():
         values["training"]["grad_accum_windows"] = args.grad_accum_windows
     if args.output_dir is not None:
         values["training"]["output_dir"] = str(args.output_dir)
+    if args.log_interval is not None:
+        values["training"]["log_interval"] = args.log_interval
     model_cfg = _cfg(values)
     if args.freeze_base:
         model_cfg.freeze_base = True
@@ -146,12 +152,27 @@ def main():
         model_cfg.freeze_base = False
     rank, world_size, local_rank, ddp_enabled = setup_distributed()
     device = get_ddp_device(local_rank, world_size)
+    print(f"[rank {rank}] constructing Pi05-Compact model on {device}", flush=True)
     raw_model = Pi05CompactModel(model_cfg, freeze_base=model_cfg.freeze_base).to(device)
+    print(f"[rank {rank}] model constructed", flush=True)
     if args.checkpoint:
-        state = torch.load(args.checkpoint, map_location="cpu")
-        raw_model.load_state_dict(state.get("model", state), strict=False)
+        if rank == 0:
+            start = time.perf_counter()
+            print(f"[rank {rank}] loading trainer checkpoint: {args.checkpoint}", flush=True)
+            state = torch.load(args.checkpoint, map_location="cpu")
+            raw_model.load_state_dict(state.get("model", state), strict=False)
+            print(f"[rank {rank}] trainer checkpoint loaded in {time.perf_counter() - start:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] waiting for DDP checkpoint broadcast", flush=True)
     if args.base_checkpoint:
-        raw_model.load_base_checkpoint(args.base_checkpoint, strict=False)
+        if rank == 0:
+            start = time.perf_counter()
+            print(f"[rank {rank}] loading base checkpoint: {args.base_checkpoint}", flush=True)
+            raw_model.load_base_checkpoint(args.base_checkpoint, strict=False)
+            print(f"[rank {rank}] base checkpoint loaded in {time.perf_counter() - start:.1f}s", flush=True)
+        else:
+            print(f"[rank {rank}] waiting for DDP base-checkpoint broadcast", flush=True)
+    rank0_print("[init] Pi05-Compact model and checkpoint loaded", flush=True)
     model = DDP(raw_model, device_ids=[local_rank] if device.type == "cuda" else None,
                 find_unused_parameters=True) if ddp_enabled else raw_model
 
@@ -171,12 +192,15 @@ def main():
     if stats_path is not None and not stats_path.is_absolute():
         stats_path = ROOT / stats_path
     stats = json.loads(stats_path.read_text()) if stats_path is not None and stats_path.exists() else None
+    tokenizer = PaligemmaTokenizer(model_cfg.max_token_len, args.tokenizer_path)
+    rank0_print("[init] dataset metadata and tokenizer loaded", flush=True)
     loader = torch.utils.data.DataLoader(
         RandomEpisodeIterableDataset(dataset, rank=rank, world_size=world_size, shuffle=True, infinite=True),
         batch_size=int(values["data"].get("batch_size", 1)),
-        collate_fn=make_collate(PaligemmaTokenizer(model_cfg.max_token_len), stats),
+        collate_fn=make_collate(tokenizer, stats),
         num_workers=int(values["data"].get("num_workers", 0)),
     )
+    rank0_print("[init] dataloader ready; beginning sequential TBPTT", flush=True)
     optimizer = AdamW((p for p in raw_model.parameters() if p.requires_grad),
                       lr=float(values["training"].get("learning_rate", 1e-4)),
                       weight_decay=float(values["training"].get("weight_decay", 0.01)))

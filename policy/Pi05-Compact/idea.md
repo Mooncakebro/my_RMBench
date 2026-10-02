@@ -637,6 +637,21 @@ environment is dedicated to OpenPI:
 python -m pip install --force-reinstall --no-deps "jaxtyping==0.2.36"
 ```
 
+Prepare the PaliGemma tokenizer once before launching DDP. This avoids four
+workers independently waiting on the `gs://big_vision` download and file lock:
+
+```bash
+REPO_ROOT="$(pwd)"
+TOKENIZER_PATH="$REPO_ROOT/assets/paligemma_tokenizer.model"
+mkdir -p "$(dirname "$TOKENIZER_PATH")"
+if [[ ! -s "$TOKENIZER_PATH" ]]; then
+  curl -fL --retry 3 \
+    "https://storage.googleapis.com/big_vision/paligemma_tokenizer.model" \
+    -o "$TOKENIZER_PATH"
+fi
+test -s "$TOKENIZER_PATH"
+```
+
 The trainer accepts explicit overrides for the values that commonly change
 between a local smoke test and an 8-GPU run. `--freeze-base` is opt-in;
 omitting it leaves the base trainable as specified by the YAML. The command
@@ -657,6 +672,8 @@ FREEZE_BASE=0
 WINDOW_SIZE=8
 GRAD_ACCUM_WINDOWS=7
 NUM_WORKERS=2
+TOKENIZER_PATH="$REPO_ROOT/assets/paligemma_tokenizer.model"
+LOG_INTERVAL=1
 BASE_CHECKPOINT="$POLICY_ROOT/checkpoints/pi05_base_pytorch"
 OUTPUT_DIR="$POLICY_ROOT/runs/pi05_compact_${TASK}"
 
@@ -668,6 +685,8 @@ TRAIN_FLAGS=(
   --window-size "$WINDOW_SIZE"
   --grad-accum-windows "$GRAD_ACCUM_WINDOWS"
   --num-workers "$NUM_WORKERS"
+  --tokenizer-path "$TOKENIZER_PATH"
+  --log-interval "$LOG_INTERVAL"
   --max-steps "$MAX_STEPS"
   --output-dir "$OUTPUT_DIR"
 )
@@ -678,6 +697,10 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   "$POLICY_ROOT/source/training/train_compact.py" "${TRAIN_FLAGS[@]}" \
   2>&1 | tee "$REPO_ROOT/train_pi05_compact_${TASK}.log"
 ```
+
+Only rank 0 reads the large base/trainer checkpoint; DDP broadcasts the
+loaded parameters when the wrapper is constructed. This prevents all ranks
+from simultaneously reading the same multi-gigabyte safetensors file.
 
 For a local one-GPU smoke test, keep the same command and set
 `CUDA_VISIBLE_DEVICES=0`, `NPROC=1`, `BATCH_SIZE=1`,
@@ -721,7 +744,8 @@ python script/eval_policy.py \
 ## 12. Python package to install under syb_lerobot
 ```bash
 pip install pytest jax beartype tqdm_loggable orbax sentencepiece chex flax
-pip install "jaxtyping==0.2.36"
+pip install "jaxtyping==0.2.36" tyro numpydantic h5py gcsfs
+pip install "gcsfs==2025.3.0"
 
 
 
