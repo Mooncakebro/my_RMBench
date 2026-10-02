@@ -757,6 +757,10 @@ pip install --force-reinstall \
   "huggingface-hub[cli,hf-transfer]==0.35.3" \
   "packaging==25.0"
 
+# wandb 0.24.2 does not support protobuf 7.x.
+pip install --force-reinstall \
+  "protobuf>=3.19.0,<7,!=4.21.0,!=5.28.0"
+
 
 
 ```
