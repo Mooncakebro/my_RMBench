@@ -172,6 +172,7 @@ def main() -> int:
                 pass
             print(f"\nTransformers patch: {'OK' if patch_ok else 'MISSING'} (version {transformers_version})")
             if not patch_ok:
+                print("  The full OpenPI replacement tree is required (SigLIP, Gemma, and PaliGemma).")
                 print(f"  cp -r {patch_root}/* "
                       '"$($PYTHON -c \'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)\')/"')
         except Exception:

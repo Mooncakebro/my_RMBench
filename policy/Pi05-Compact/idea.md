@@ -626,6 +626,26 @@ import openpi.models_pytorch.pi0_pytorch as pi0
 print("compact:", compact.__file__)
 print("openpi:", pi0.__file__)
 PY
+
+# Pi05 requires OpenPI's complete Transformers replacement tree.  Install the
+# Git-synchronized policy copy into the exact environment used by torchrun;
+# copying only SigLIP (or an older tree from another OpenPI checkout) leaves
+# GemmaRMSNorm unpatched and fails later at ``cond=...``.
+PYTHON="${PYTHON:-$(command -v python)}"
+TRANSFORMERS_SITE="$($PYTHON -c 'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')"
+cp -r "$POLICY_ROOT/vendor/openpi_torch/openpi/models_pytorch/transformers_replace/"* \
+  "$TRANSFORMERS_SITE/"
+"$PYTHON" - <<'PY'
+import inspect
+import transformers
+from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
+from transformers.models.siglip import check
+
+assert transformers.__version__ == "4.53.2", transformers.__version__
+assert "cond" in inspect.signature(GemmaRMSNorm.forward).parameters
+assert check.check_whether_transformers_replace_is_installed_correctly()
+print("OpenPI Transformers replacement: OK")
+PY
 ```
 
 The vendored `array_typing.py` tolerates jaxtyping versions where OpenPI's
