@@ -53,7 +53,7 @@ REQUIREMENTS = (
     Requirement("gcsfs", "gcsfs==2025.3.0", "OpenPI gs:// tokenizer/assets downloads", frozenset({"conversion", "training"})),
     Requirement("huggingface_hub", "huggingface-hub>=0.34.2,<0.36.0", "LeRobot hub client compatibility", frozenset({"training", "data"})),
     Requirement("packaging", "packaging>=24.2,<26.0", "LeRobot version parsing compatibility", frozenset({"training", "data"})),
-    Requirement("protobuf", "protobuf>=3.19.0,<7,!=4.21.0,!=5.28.0", "Weights & Biases runtime compatibility", frozenset({"training"})),
+    Requirement("google.protobuf", "protobuf>=3.19.0,<7,!=4.21.0,!=5.28.0", "Weights & Biases runtime compatibility", frozenset({"training"})),
     Requirement("filelock", "filelock", "OpenPI download/cache helpers", frozenset({"conversion", "training"})),
     Requirement("tqdm_loggable", "tqdm-loggable", "OpenPI restore progress", frozenset({"conversion", "training"})),
     Requirement("numpydantic", "numpydantic", "OpenPI normalization types", frozenset({"conversion", "training"})),
