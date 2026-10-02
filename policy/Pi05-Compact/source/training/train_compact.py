@@ -113,6 +113,19 @@ def make_collate(tokenizer, stats):
     return collate
 
 
+def _move_to_device(value, device):
+    """Move tensors in nested observation dictionaries to the model device."""
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path(__file__).parents[1] / "config/pi05_compact_train.yaml")
@@ -215,7 +228,7 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     for frame_step, batch in enumerate(loader, 1):
         obs, actions = batch["observation"], batch["actions"]
-        obs = SimpleNamespace(**{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vars(obs).items()})
+        obs = SimpleNamespace(**{k: _move_to_device(v, device) for k, v in vars(obs).items()})
         actions = actions.to(device)
         episode_ids = batch["episode_id"].to(device)
         if memory is None:
