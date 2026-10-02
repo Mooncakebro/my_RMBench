@@ -85,7 +85,10 @@ class GemmaRMSNorm(nn.Module):
             raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
         
         #self.dense.to(dtype=torch.bfloat16).to(dtype=torch.float32)
-        modulation = self.dense(cond)
+        # The adaptive projection is intentionally kept in float32 by the
+        # Pi05 precision policy, while its condition often arrives in bf16.
+        # Linear layers require matching dtypes.
+        modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
         # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
         if len(x.shape) == 3:  # [batch, seq, features]
             modulation = modulation.unsqueeze(1)

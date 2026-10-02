@@ -16,7 +16,8 @@ def check_whether_transformers_replace_is_installed_correctly():
         from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 
         gemma_params = inspect.signature(GemmaRMSNorm.forward).parameters
-        if "cond" not in gemma_params:
+        gemma_source = inspect.getsource(GemmaRMSNorm.forward)
+        if "cond" not in gemma_params or "self.dense.weight.dtype" not in gemma_source:
             return False
         # The replacement contains the explicit LayerNorm dtype boundary
         # required when the Pi05 vision stream runs in bfloat16.

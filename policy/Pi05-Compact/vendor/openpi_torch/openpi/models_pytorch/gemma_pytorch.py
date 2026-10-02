@@ -193,6 +193,16 @@ class PaliGemmaWithExpertModel(nn.Module):
                 for i, hidden_states in enumerate(inputs_embeds):
                     layer = models[i].layers[layer_idx]
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+                    # OpenPI keeps the decoder projections in bf16, while
+                    # some RMSNorm implementations compute in float32.
+                    # Normalize the stream at the projection boundary so a
+                    # stale/partially installed Transformers replacement
+                    # cannot produce a mat1/mat2 dtype failure here.
+                    projection_dtype = layer.self_attn.q_proj.weight.dtype
+                    if hidden_states.dtype != projection_dtype:
+                        hidden_states = hidden_states.to(dtype=projection_dtype)
+                    if gate is not None and gate.dtype != hidden_states.dtype:
+                        gate = gate.to(dtype=hidden_states.dtype)
                     gates.append(gate)
 
                     input_shape = hidden_states.shape[:-1]
@@ -251,15 +261,21 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                    if out_emb.dtype != layer.self_attn.o_proj.weight.dtype:
+                        out_emb = out_emb.to(dtype=layer.self_attn.o_proj.weight.dtype)
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                    mlp_dtype = layer.mlp.up_proj.weight.dtype
+                    if out_emb.dtype != mlp_dtype:
+                        out_emb = out_emb.to(dtype=mlp_dtype)
+                    if gate is not None and gate.dtype != out_emb.dtype:
+                        gate = gate.to(dtype=out_emb.dtype)
 
                     out_emb = layer.mlp(out_emb)
                     # second residual
                     out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                    if out_emb.dtype != mlp_dtype:
+                        out_emb = out_emb.to(dtype=mlp_dtype)
                     outputs_embeds.append(out_emb)
                     start_pos = end_pos
 
