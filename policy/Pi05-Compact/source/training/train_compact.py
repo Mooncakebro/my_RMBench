@@ -49,10 +49,25 @@ class WindowDataset:
         self.dataset, self.horizon = dataset, horizon
         self.episode_to_indices = getattr(dataset, "episode_to_indices", None)
         if self.episode_to_indices is None:
-            self.episode_to_indices = {}
-            for i in range(len(dataset)):
-                episode = int(dataset[i]["episode_id"])
-                self.episode_to_indices.setdefault(episode, []).append(i)
+            # LeRobot stores authoritative contiguous global index ranges in
+            # meta.episodes.  Use them directly; scanning dataset[i] would
+            # decode every video frame just to reconstruct this mapping.
+            episodes = getattr(getattr(dataset, "meta", None), "episodes", None)
+            if episodes is not None and all(
+                key in episodes.column_names
+                for key in ("episode_index", "dataset_from_index", "dataset_to_index")
+            ):
+                self.episode_to_indices = {
+                    int(row["episode_index"]): list(
+                        range(int(row["dataset_from_index"]), int(row["dataset_to_index"]))
+                    )
+                    for row in episodes
+                }
+            else:
+                self.episode_to_indices = {}
+                for i in range(len(dataset)):
+                    episode = int(dataset[i]["episode_id"])
+                    self.episode_to_indices.setdefault(episode, []).append(i)
 
     def __len__(self):
         return len(self.dataset)
