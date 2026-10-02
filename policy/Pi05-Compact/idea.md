@@ -751,6 +751,12 @@ pip install "gcsfs==2025.3.0"
 # repair: transformers 4.53.2 requires tokenizers in the 0.21.x series.
 pip install --force-reinstall "transformers==4.53.2" "tokenizers>=0.21,<0.22"
 
+# Compatible with gcsfs 2025.3.0, datasets 4.8.5, and LeRobot 0.4.4.
+pip install --force-reinstall \
+  "fsspec==2025.3.0" \
+  "huggingface-hub[cli,hf-transfer]==0.35.3" \
+  "packaging==25.0"
+
 
 
 ```
