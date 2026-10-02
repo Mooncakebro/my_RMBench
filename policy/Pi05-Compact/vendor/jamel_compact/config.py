@@ -29,7 +29,11 @@ class CompactConfig:
     lora_bias: str = "none"
 
     # ── Model version (for checkpoint compatibility) ──
-    model_version: int = 2            # v1=1, v2=2 (U1/U2 change side_memories.pt keys)
+    # v1=1, v2=2 (U1/U2 change side_memories.pt keys),
+    # v3=3 (normalized obs space, log-R R_psi, query-based obs model —
+    #       adds obs_pred_queries/obs_pred_attn keys; old R_psi weights
+    #       change semantics from softplus to log-R, so retrain memory modules)
+    model_version: int = 3
 
     # ── Hierarchical hyperparameters ──
     lambda_shallow: float = 0.70

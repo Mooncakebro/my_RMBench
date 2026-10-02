@@ -90,6 +90,16 @@ class SideMemoryModule(nn.Module):
     - U3: Observation model + surprise (obs_model predicts observations;
           surprise e feeds next step's variance inflation)
 
+    v3 changes (see policy/Mem0-Compact/MEM0_COMPACT_AUX_LOSS_ANALYSIS.md):
+    - Observation space is LayerNorm'ed (no affine) per token, so surprise e
+      is O(1) regardless of frozen-backbone hidden-state scale; this un-
+      saturates surprise_clip and puts r_min/init_variance back in range.
+    - R_psi output is log R (R = exp(log_r) + r_min) — scale-free NLL
+      calibration (softplus stalled ~45x below actual surprise).
+    - Observation model reads ALL memory slots via k learned queries +
+      cross-attention (was: slot mean) and predicts each of the k observation
+      tokens individually (was: token mean).
+
     Dimension flow:
       • Main stream H:  d (e.g. 2048 or 4096)
       • Memory state M: d_mem (e.g. 512)
@@ -143,6 +153,12 @@ class SideMemoryModule(nn.Module):
             mem_dim, obs_heads, batch_first=True,
         )
 
+        # v3: Normalize the observation space. z is LayerNorm'ed (no affine)
+        # per token, so surprise e = MSE(z_pred, z) is O(1) regardless of the
+        # frozen backbone's hidden-state scale (which grows with depth and
+        # previously saturated surprise_clip and left R ~45x miscalibrated).
+        self.obs_norm = nn.LayerNorm(mem_dim, elementwise_affine=False)
+
         # ── Innovation cross-attention (now with k KV tokens, not 1) ──
         self.mem_cross_attn = nn.MultiheadAttention(
             mem_dim, num_heads, batch_first=True,
@@ -152,14 +168,23 @@ class SideMemoryModule(nn.Module):
         # ── U2: Learned process noise Q_theta: Linear(d_mem → N_m) + softplus ──
         self.Q_theta = nn.Linear(mem_dim, num_mem)
 
-        # ── U2: Learned observation noise R_psi: MLP(d_mem → 128 → N_m) + softplus ──
+        # ── U2/v3: Learned observation noise R_psi: MLP(d_mem → 128 → N_m).
+        # Output is interpreted as log R (see correct()): R = exp(log_r) + r_min.
         self.R_psi = nn.Sequential(
             nn.Linear(mem_dim, 128),
             nn.GELU(),
             nn.Linear(128, num_mem),
         )
 
-        # ── U3: Observation model MLP(d_mem → d_mem → d_mem) ──
+        # ── U3/v3: Observation model — k learned queries cross-attend to ALL
+        # memory slots (not the slot mean), then a per-token MLP predicts each
+        # of the k observation tokens individually. ──
+        self.obs_pred_queries = nn.Parameter(
+            torch.randn(num_obs_tokens, mem_dim) * 0.02
+        )
+        self.obs_pred_attn = nn.MultiheadAttention(
+            mem_dim, obs_heads, batch_first=True,
+        )
         self.obs_model = nn.Sequential(
             nn.Linear(mem_dim, mem_dim),
             nn.GELU(),
@@ -281,11 +306,17 @@ class SideMemoryModule(nn.Module):
         delta_raw, _ = self.mem_cross_attn(m_hat, z_down, z_down)  # [B, N_m, d_mem]
         delta_m = self.innovation_proj(delta_raw)
 
-        # ── U2: Learned observation noise R ──
+        # ── U2/v3: Learned observation noise R (log-parameterized) ──
+        # R = exp(log_r) + r_min: the multiplicative parameterization makes
+        # the NLL gradient scale-free. (The old softplus output needed O(100s)
+        # of weight growth to reach the observed surprise scale and stalled
+        # ~45x miscalibrated.) log_r is clamped for bf16/stability.
         z_mean = z_down.mean(dim=1)  # [B, d_mem]
+        log_r = self.R_psi(z_mean).float().clamp(min=-10.0, max=10.0)
+        R_f = torch.exp(log_r) + self.r_min  # [B, N_m] float32
         # r_min floor: keeps log R finite and bounds e/R so the NLL cannot
         # explode when the learned noise collapses toward zero.
-        R = F.softplus(self.R_psi(z_mean)) + self.r_min  # [B, N_m]
+        R = R_f.to(m_hat.dtype)
 
         # ── U2: Kalman gain K = P_hat / (P_hat + R) ──
         learned_K = p_hat / (p_hat + R + eps)  # [B, N_m]
@@ -307,14 +338,23 @@ class SideMemoryModule(nn.Module):
         m_new = m_hat + K_exp * delta_m
         p_new = (1 - K_exp.squeeze(-1)) * p_hat  # [B, N_m]
 
-        # ── U3: Observation model — predict what we'll see ──
-        z_pred = self.obs_model(m_hat.mean(dim=1))  # [B, d_mem]
-        z_target = z_mean.detach()  # [B, d_mem]
+        # ── U3/v3: Observation model — predict what we'll see ──
+        # k learned queries read ALL memory slots (not the slot mean), then
+        # the MLP predicts each of the k observation tokens individually.
+        pred_queries = self.obs_pred_queries.unsqueeze(0).expand(B, -1, -1)
+        mem_ctx, _ = self.obs_pred_attn(pred_queries, m_hat, m_hat)  # [B, k, d_mem]
+        z_pred = self.obs_model(mem_ctx)  # [B, k, d_mem]
+        # Scale-free loss: z_down tokens are already obs_norm'ed; normalize
+        # z_pred the same way so the MSE is O(1) (bounded by ~4) and the
+        # surprise fed into next step's variance inflation never saturates
+        # surprise_clip.
+        z_pred_n = F.layer_norm(z_pred.float(), (d_mem,))
+        z_target = z_down.detach().float()  # [B, k, d_mem]
         # .float(): bf16 mse_loss is not implemented on CPU (local CPU eval).
-        e_per_sample = F.mse_loss(z_pred.float(), z_target.float(), reduction='none').mean(dim=-1)  # [B]
+        e_per_sample = F.mse_loss(z_pred_n, z_target, reduction='none').mean(dim=(-1, -2))  # [B]
 
         # L_obs: trains the observation model
-        loss_obs = F.mse_loss(z_pred.float(), z_target.float())
+        loss_obs = F.mse_loss(z_pred_n, z_target)
 
         # L_nll: Gaussian NLL calibrates R against actual surprise.
         # NOTE: e_per_sample is ALREADY the squared residual (per-sample MSE),
@@ -323,7 +363,6 @@ class SideMemoryModule(nn.Module):
         # which explodes and starves the action CE under global grad clipping).
         # Computed in float32 for bf16 stability.
         e_detached = e_per_sample.detach().unsqueeze(-1).float()  # [B, 1]
-        R_f = R.float()
         loss_nll = 0.5 * (torch.log(R_f) + e_detached / R_f).mean()
         loss_nll = loss_nll.to(R.dtype)
 
@@ -414,6 +453,10 @@ class SideMemoryModule(nn.Module):
         z_down, _ = self.obs_attn(
             queries, h_down, h_down, key_padding_mask=key_padding_mask,
         )  # [B, k, d_mem]
+        # v3: per-token normalization puts the observation space at O(1)
+        # scale (see __init__ note); feeds innovation, R_psi, and the obs
+        # prediction target.
+        z_down = self.obs_norm(z_down)
         return z_down
 
 
@@ -1736,6 +1779,9 @@ class JAMELCompactWrapper(nn.Module):
                 if key.endswith(".inject_gate") and value.ndim == 0:
                     sm_state[key] = value.unsqueeze(0)
             incompatible = model.side_memories.load_state_dict(sm_state, strict=False)
+            if incompatible.missing_keys:
+                print(f"[load] Freshly initialized side-memory keys "
+                      f"(not in checkpoint, e.g. new in v3): {incompatible.missing_keys}")
             if incompatible.unexpected_keys:
                 print(f"[load] Ignored legacy side-memory keys: {incompatible.unexpected_keys}")
             ae_state = torch.load(side_mem_dir / "action_embed.pt", map_location="cpu")
