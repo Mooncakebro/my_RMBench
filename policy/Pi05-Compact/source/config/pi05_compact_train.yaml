@@ -14,7 +14,7 @@ compact:
   freeze_base: false
   lambda_obs: 0.01
   lambda_nll: 0.01
-  lambda_mem: 0.001
+  lambda_mem: 0.0
   base_checkpoint: checkpoints/pi05_base_pytorch
 data:
   root: lerobot_datasets/swap_blocks

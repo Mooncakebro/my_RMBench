@@ -30,7 +30,7 @@ execution_module:
     gradient_checkpointing: false
     lambda_obs: 0.01
     lambda_nll: 0.01
-    lambda_mem: 0.001
+    lambda_mem: 0.0
 
   # Flow-matching DiT action head (copied from Mem-0, unchanged)
   action_model:
@@ -105,7 +105,7 @@ trainer:
     qwen_model: 1.0e-5
     action_model: 1.0e-4
     classifier: 1.0e-4
-    memory: 5.0e-6        # side-memory modules only
+    memory: 5.0e-5        # side-memory modules only
 
 validation:
   enabled: true
