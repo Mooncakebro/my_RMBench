@@ -323,6 +323,15 @@ already DDP-correct). Keep its loop structure verbatim; swap the model/loss:
   around non-last accumulation windows; `all_ranks_finite` guards on loss and
   grad norm (skip update on any non-finite rank); memory is per-sample,
   no cross-rank coupling.
+- **Input pipeline**: the current frame is the only sample that decodes
+  images. `WindowDataset` reads the action column once from the LeRobot
+  parquet files and slices/pads the horizon in memory, avoiding up to
+  `action_horizon - 1` extra video decodes per frame. It also filters
+  LeRobot's video metadata to the three camera keys consumed by Pi05.
+- Keep `find_unused_parameters=True` for the unfrozen base model: the custom
+  inputs-embeds path leaves some pretrained heads unused. It may be disabled
+  only after a dedicated DDP run proves every trainable parameter participates
+  on every rank.
 - **Loss per frame**:
   `L = 1.0·L_flow + 0.01·L_obs + 0.01·L_nll + 0.001·L_mem`.
   `L_flow` = mean over `(B, H, 32)` of π0.5's flow-matching MSE (Beta(1.5,1)

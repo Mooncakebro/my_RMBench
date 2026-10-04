@@ -11,6 +11,7 @@ import json
 import math
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,13 @@ def _cfg(values):
 
 class WindowDataset:
     """Expose one frame plus a contiguous action horizon from LeRobot."""
+
+    IMAGE_KEYS = (
+        "observation.image.head_camera",
+        "observation.image.left_camera",
+        "observation.image.right_camera",
+    )
+
     def __init__(self, dataset, horizon):
         self.dataset, self.horizon = dataset, horizon
         self.episode_to_indices = getattr(dataset, "episode_to_indices", None)
@@ -68,6 +76,47 @@ class WindowDataset:
                 for i in range(len(dataset)):
                     episode = int(dataset[i]["episode_id"])
                     self.episode_to_indices.setdefault(episode, []).append(i)
+        # Pre-load the action columns once.  Building a horizon of H actions
+        # through dataset[i] costs H video-frame decodes per training frame
+        # (LeRobotDataset decodes the image on every access even when only
+        # "action" is used); the parquet action columns are tiny, so read
+        # them directly and slice horizons in memory instead.
+        self.actions = self._preload_actions(dataset)
+
+    @staticmethod
+    def _preload_actions(dataset):
+        """Return a [total_frames, action_dim] float32 tensor of all actions,
+        or None to fall back to per-row dataset lookups.
+
+        LeRobot v3.0 stores rows in global-index order across
+        data/chunk-*/file-*.parquet, so concatenating the action columns in
+        sorted file order reproduces dataset indices exactly.
+        """
+        try:
+            import pyarrow.parquet as pq
+
+            root = Path(dataset.root)
+            files = sorted((root / "data").glob("chunk-*/file-*.parquet"))
+            if not files:
+                return None
+            action_arrays, index_arrays = [], []
+            for path in files:
+                table = pq.read_table(path, columns=["action", "index"])
+                action_arrays.append(np.asarray(table["action"].to_pylist(), dtype=np.float32))
+                index_arrays.append(np.asarray(table["index"].to_numpy(), dtype=np.int64))
+            actions_np = np.concatenate(action_arrays, axis=0)
+            indices_np = np.concatenate(index_arrays, axis=0)
+            if not np.array_equal(np.sort(indices_np), np.arange(len(dataset))):
+                return None
+            # Usually files are already in global-index order. Sort defensively
+            # so appended/repacked parquet files cannot silently misalign the
+            # action horizon with the decoded observation at ``dataset[index]``.
+            order = np.argsort(indices_np, kind="stable")
+            return torch.from_numpy(actions_np[order].copy())
+        except Exception as exc:
+            print(f"[data] action pre-load failed ({exc}); "
+                  "falling back to per-row dataset lookups", flush=True)
+            return None
 
     def __len__(self):
         return len(self.dataset)
@@ -76,12 +125,22 @@ class WindowDataset:
         item = self.dataset[index]
         episode = int(item["episode_id"])
         indices = self.episode_to_indices[episode]
+        item = dict(item)
+        if self.actions is not None:
+            # episode rows are contiguous global indices; clamp at episode end
+            end = indices[-1]
+            stop = min(index + self.horizon, end + 1)
+            action = self.actions[index:stop]
+            if action.shape[0] < self.horizon:
+                action = torch.cat([action, action[-1:].expand(self.horizon - action.shape[0], -1)], dim=0)
+            item["action"] = action
+            return item
+        # Fallback: per-row dataset lookups (decodes a video frame per row).
         pos = indices.index(index)
         action = []
         for j in range(self.horizon):
             source = self.dataset[indices[min(pos + j, len(indices) - 1)]]
             action.append(torch.as_tensor(source["action"], dtype=torch.float32))
-        item = dict(item)
         item["action"] = torch.stack(action)
         return item
 
@@ -97,6 +156,21 @@ def _image_tensor(value):
         if x.max() > 1.5:
             x = x / 127.5 - 1.0
     return x
+
+
+def _restrict_video_features(dataset):
+    """Prevent LeRobot from decoding cameras that Pi05 never consumes."""
+    meta = getattr(dataset, "meta", None)
+    if meta is None or not hasattr(meta, "info"):
+        return
+    features = meta.info.get("features", {})
+    keep = set(WindowDataset.IMAGE_KEYS)
+    filtered = {
+        key: value
+        for key, value in features.items()
+        if value.get("dtype") not in {"video", "image"} or key in keep
+    }
+    meta.info["features"] = filtered
 
 
 def make_collate(tokenizer, stats):
@@ -214,7 +288,14 @@ def main():
         root = ROOT / root
     if args.task:
         root = root.parent / args.task
-    dataset = WindowDataset(LeRobotDataset(repo_id=root.name, root=root), model_cfg.action_horizon)
+    lerobot_dataset = LeRobotDataset(repo_id=root.name, root=root)
+    _restrict_video_features(lerobot_dataset)
+    dataset = WindowDataset(lerobot_dataset, model_cfg.action_horizon)
+    rank0_print(
+        f"[data] cameras={len(lerobot_dataset.meta.video_keys)} "
+        f"action_horizon={'parquet-preloaded' if dataset.actions is not None else 'dataset-lookups'}",
+        flush=True,
+    )
     stats_value = values["data"].get("norm_stats")
     stats_path = Path(stats_value) if stats_value else None
     if stats_path is not None and not stats_path.is_absolute():
@@ -251,13 +332,25 @@ def main():
             prev_action = torch.zeros(actions.shape[0], 16, device=device)
         reset = [True] * len(episode_ids) if frame_step == 1 else (episode_ids != last_episode).tolist()
         raw_model.reset_memory_rows(memory, reset, device)
-        out, memory = model(obs, actions, memory=memory, prev_action=prev_action)
-        window_loss = out["total"] if window_loss is None else window_loss + out["total"]
+        # DDP.no_sync() must cover BOTH the forward and backward of every
+        # non-final accumulation window; otherwise each window's backward
+        # triggers a full gradient all-reduce (accum_windows syncs per
+        # optimizer step instead of one).
+        last_accum_window = windows_since_update == accum_windows - 1
+        sync_ctx = (
+            nullcontext()
+            if (not ddp_enabled) or last_accum_window
+            else model.no_sync()
+        )
+        with sync_ctx:
+            out, memory = model(obs, actions, memory=memory, prev_action=prev_action)
+            window_loss = out["total"] if window_loss is None else window_loss + out["total"]
+            if frame_step % window == 0:
+                (window_loss / (window * accum_windows)).backward()
+                window_loss = None
         prev_action = batch["state"].to(device)
         last_episode = episode_ids
         if frame_step % window == 0:
-            (window_loss / (window * accum_windows)).backward()
-            window_loss = None
             windows_since_update += 1
             memory = raw_model.detach_memory(memory)
             prev_action = prev_action.detach()
