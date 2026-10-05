@@ -2,7 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 TASK="${TASK_NAME:-swap_blocks}"
-python script/eval_policy.py --config policy/Pi05-Compact/deploy_policy.yml --overrides \
+PYTHON="${PYTHON:-$(command -v python)}"
+POLICY_ROOT="$(pwd)/policy/Pi05-Compact"
+PYTHON="$PYTHON" POLICY_ROOT="$POLICY_ROOT" \
+  bash "$POLICY_ROOT/scripts/install_transformers_patch.sh"
+"$PYTHON" script/eval_policy.py --config policy/Pi05-Compact/deploy_policy.yml --overrides \
   --task_name "$TASK" \
   --task_config "${TASK_CONFIG:-demo_clean}" \
   --ckpt_setting pi05_compact \
