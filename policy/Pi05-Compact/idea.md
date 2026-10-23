@@ -770,7 +770,8 @@ python script/eval_policy.py \
 ```
 
 
-## 12. Python package to install under syb_lerobot
+## 12. Python package to install
+### 12.1 Python package to install under syb_lerobot
 ```bash
 pip install pytest jax beartype tqdm_loggable orbax sentencepiece chex flax
 pip install "jaxtyping==0.2.36" tyro numpydantic h5py gcsfs
@@ -790,6 +791,13 @@ pip install --force-reinstall \
 pip install --force-reinstall \
   "protobuf>=3.19.0,<7,!=4.21.0,!=5.28.0"
 
+
+
+```
+### 12.2 Python package to install under syb_RMBench
+```bash
+pip install pytest jax beartype tqdm_loggable orbax sentencepiece chex flax -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install "jaxtyping==0.2.36" tyro numpydantic h5py gcsfs
 
 
 ```

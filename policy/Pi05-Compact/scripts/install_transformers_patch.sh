@@ -21,6 +21,8 @@ TRANSFORMERS_SITE="$($PYTHON -c \
 TRANSFORMERS_VERSION="$($PYTHON -c 'import transformers; print(transformers.__version__)')"
 if [[ "$TRANSFORMERS_VERSION" != "4.53.2" ]]; then
   echo "Expected transformers==4.53.2, found $TRANSFORMERS_VERSION" >&2
+  echo "Repair this exact environment with:" >&2
+  echo "  $PYTHON -m pip install --force-reinstall 'transformers==4.53.2' 'tokenizers>=0.21,<0.22'" >&2
   exit 1
 fi
 
