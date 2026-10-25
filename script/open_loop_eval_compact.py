@@ -6,7 +6,8 @@ updates the policy's recurrent COMPACT state from dataset observations, and
 occasionally predicts an action chunk. Predicted chunks are compared with the
 corresponding ground-truth action horizon; predicted actions are never applied
 to the observations. Results include model-space and, when available,
-denormalized action errors, per-lead errors, and compressed prediction arrays.
+denormalized action errors, per-lead errors, stitched trajectory metrics, and
+one state/ground-truth/prediction plot per episode.
 
 Use the policy's own environment: Mem0-Compact commonly uses the RMBench
 environment, while Pi05-Compact may need its separate Transformers-patched
@@ -15,12 +16,11 @@ environment.
 Examples (from the RMBench repository root):
     python script/open_loop_eval_compact.py --policy mem0 \
       --checkpoint policy/Mem0-Compact/runs/compact_swap_blocks/ckpt_best.pt \
-      --task swap_blocks --episode-ids 0 1 --steps 200
+      --task swap_blocks
 
     python script/open_loop_eval_compact.py --policy pi05 \
       --checkpoint policy/Pi05-Compact/runs/pi05_compact_swap_blocks/ckpt_final.pt \
-      --task swap_blocks --tokenizer-path /path/to/paligemma_tokenizer.model \
-      --episode-ids 0 --steps 200 --stride 10
+      --task swap_blocks --tokenizer-path /path/to/paligemma_tokenizer.model
 """
 from __future__ import annotations
 
@@ -60,13 +60,16 @@ def _parser() -> argparse.ArgumentParser:
                         help="local PaliGemma tokenizer model (Pi05; avoids GCS lookup)")
     parser.add_argument("--task", type=str, default=None,
                         help="task override; otherwise inferred from the training config")
-    parser.add_argument("--episode-ids", type=int, nargs="+", default=[0])
+    parser.add_argument("--episode-ids", type=int, nargs="+", default=None,
+                        help="episodes to evaluate; omit to evaluate every episode")
+    parser.add_argument("--max-episodes", type=int, default=None,
+                        help="optional cap after episode selection, useful for smoke tests")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="first frame eligible to be an evaluation anchor; earlier frames warm recurrent memory")
-    parser.add_argument("--steps", type=int, default=100,
-                        help="number of frame positions to evaluate per episode, starting at --start-frame")
-    parser.add_argument("--stride", type=int, default=1,
-                        help="predict at every Nth frame; recurrent state is still updated on intervening frames")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="frames to evaluate per episode; omit for the complete valid trajectory")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="frames between action predictions; defaults to action horizon (MoDE-style chunks)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sampling-steps", type=int, default=10,
@@ -289,41 +292,61 @@ def _load_raw_lerobot(root: Path, video_backend: str, image_keys: set[str]):
     return dataset
 
 
-def _preload_actions(dataset, root: Path) -> np.ndarray:
-    """Load action rows from parquet once, in LeRobot's global index order."""
+def _preload_trajectory_vectors(dataset, root: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load action/state rows once in authoritative global-index order."""
     import pyarrow.parquet as pq
 
     files = sorted((root / "data").glob("chunk-*/file-*.parquet"))
     if not files:
         raise FileNotFoundError(f"No data/chunk-*/file-*.parquet files under {root}")
-    actions, indices = [], []
+    actions, states, indices = [], [], []
     has_index = True
     for path in files:
         schema_names = set(pq.read_schema(path).names)
-        if "action" not in schema_names:
-            raise KeyError(f"No 'action' column in {path}")
-        cols = ["action"] + (["index"] if "index" in schema_names else [])
+        required = {"action", "observation.state"}
+        if not required.issubset(schema_names):
+            raise KeyError(f"Missing {sorted(required - schema_names)} in {path}")
+        cols = ["action", "observation.state"] + (["index"] if "index" in schema_names else [])
         table = pq.read_table(path, columns=cols)
-        values = np.asarray(table["action"].to_pylist(), dtype=np.float32)
-        if values.ndim != 2:
-            raise ValueError(f"Expected 2D action rows in {path}, got shape={values.shape}")
-        actions.append(values)
+        action_values = np.asarray(table["action"].to_pylist(), dtype=np.float32)
+        state_values = np.asarray(table["observation.state"].to_pylist(), dtype=np.float32)
+        if action_values.ndim != 2 or state_values.ndim != 2:
+            raise ValueError(
+                f"Expected 2D action/state rows in {path}, got "
+                f"{action_values.shape} and {state_values.shape}"
+            )
+        actions.append(action_values)
+        states.append(state_values)
         if "index" in cols:
             indices.append(np.asarray(table["index"].to_pylist(), dtype=np.int64))
         else:
             has_index = False
     action_rows = np.concatenate(actions, axis=0)
+    state_rows = np.concatenate(states, axis=0)
     if has_index and len(indices) == len(actions):
         row_indices = np.concatenate(indices, axis=0)
         if len(row_indices) != len(dataset) or not np.array_equal(np.sort(row_indices), np.arange(len(dataset))):
             raise ValueError("Parquet 'index' values do not form the expected LeRobot dataset range")
-        action_rows = action_rows[np.argsort(row_indices, kind="stable")]
+        order = np.argsort(row_indices, kind="stable")
+        action_rows = action_rows[order]
+        state_rows = state_rows[order]
     elif len(action_rows) != len(dataset):
         raise ValueError(
             f"Parquet actions have {len(action_rows)} rows, LeRobot reports {len(dataset)}; "
             "cannot align action targets safely."
         )
-    return action_rows
+    if len(state_rows) != len(dataset):
+        raise ValueError(f"Parquet states have {len(state_rows)} rows, LeRobot reports {len(dataset)}")
+    return action_rows, state_rows
+
+
+def _action_names(dataset, action_dim: int) -> list[str]:
+    meta = getattr(dataset, "meta", None)
+    features = getattr(meta, "features", {}) if meta is not None else {}
+    names = features.get("action", {}).get("names") if isinstance(features, dict) else None
+    if isinstance(names, list) and len(names) >= action_dim:
+        return [str(name) for name in names[:action_dim]]
+    return [f"joint_{index}" for index in range(action_dim)]
 
 
 def _as_numpy(value) -> np.ndarray:
@@ -339,6 +362,17 @@ def _vector16(value) -> np.ndarray:
     if vector.size < 16:
         vector = np.pad(vector, (0, 16 - vector.size))
     return vector
+
+
+def _vectors16(value) -> np.ndarray:
+    vectors = np.asarray(value, dtype=np.float32)
+    if vectors.ndim != 2:
+        raise ValueError(f"Expected a 2D trajectory array, got {vectors.shape}")
+    if vectors.shape[1] > 16:
+        vectors = vectors[:, :16]
+    elif vectors.shape[1] < 16:
+        vectors = np.pad(vectors, ((0, 0), (0, 16 - vectors.shape[1])))
+    return vectors
 
 
 def _image_nchw(value) -> torch.Tensor:
@@ -439,13 +473,90 @@ def _metrics(pred: np.ndarray, target: np.ndarray, pred_raw: np.ndarray,
     }
 
 
+def _trajectory_metrics(pred: np.ndarray, target: np.ndarray,
+                        pred_raw: np.ndarray, target_raw: np.ndarray,
+                        state_raw: np.ndarray, names: list[str]) -> dict:
+    error = pred - target
+    raw_error = pred_raw - target_raw
+    persistence_error = state_raw - target_raw
+    persistence_mse = float(np.mean(persistence_error ** 2))
+    raw_mse = float(np.mean(raw_error ** 2))
+    per_joint = []
+    for index, name in enumerate(names):
+        per_joint.append({
+            "index": index,
+            "name": name,
+            "model_space_mse": float(np.mean(error[:, index] ** 2)),
+            "model_space_mae": float(np.mean(np.abs(error[:, index]))),
+            "raw_action_mse": float(np.mean(raw_error[:, index] ** 2)),
+            "raw_action_mae": float(np.mean(np.abs(raw_error[:, index]))),
+            "persistence_mse": float(np.mean(persistence_error[:, index] ** 2)),
+            "persistence_mae": float(np.mean(np.abs(persistence_error[:, index]))),
+        })
+    return {
+        "frames": int(len(pred)),
+        "model_space_mse": float(np.mean(error ** 2)),
+        "model_space_mae": float(np.mean(np.abs(error))),
+        "raw_action_mse": raw_mse,
+        "raw_action_mae": float(np.mean(np.abs(raw_error))),
+        "persistence_mse": persistence_mse,
+        "persistence_mae": float(np.mean(np.abs(persistence_error))),
+        "mse_improvement_over_persistence": (
+            float(1.0 - raw_mse / persistence_mse) if persistence_mse > 0 else None
+        ),
+        "per_joint": per_joint,
+    }
+
+
+def _plot_trajectory(frame_indices: np.ndarray, state_raw: np.ndarray,
+                     target_raw: np.ndarray, pred_raw: np.ndarray,
+                     anchor_frames: np.ndarray, names: list[str],
+                     episode_id: int, path: Path) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Trajectory plotting requires matplotlib") from exc
+
+    action_dim = target_raw.shape[1]
+    columns = 4
+    rows = (action_dim + columns - 1) // columns
+    fig, axes = plt.subplots(rows, columns, figsize=(20, 3.3 * rows), sharex=True)
+    axes = np.asarray(axes).reshape(-1)
+    for index in range(action_dim):
+        axis = axes[index]
+        axis.plot(frame_indices, state_raw[:, index], color="0.45", linewidth=1.0, label="state")
+        axis.plot(frame_indices, target_raw[:, index], color="tab:blue", linewidth=1.2, label="GT action")
+        axis.plot(frame_indices, pred_raw[:, index], color="tab:orange", linewidth=1.2, label="pred action")
+        for anchor in anchor_frames:
+            axis.axvline(anchor, color="tab:red", alpha=0.12, linewidth=0.7)
+        joint_mae = float(np.mean(np.abs(pred_raw[:, index] - target_raw[:, index])))
+        axis.set_title(f"{index}: {names[index]}  MAE={joint_mae:.4g}")
+        axis.grid(alpha=0.2)
+    for axis in axes[action_dim:]:
+        axis.set_visible(False)
+    for axis in axes[-columns:]:
+        if axis.get_visible():
+            axis.set_xlabel("episode frame")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3)
+    fig.suptitle(f"Open-loop action trajectory - episode {episode_id}", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 @torch.inference_mode()
-def _evaluate_mem0(args, model, dataset, bounds, stats, episode_id: int,
-                   device: torch.device, output_dir: Path, horizon: int) -> dict:
+def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
+                   episode_id: int, device: torch.device, output_dir: Path,
+                   horizon: int, names: list[str]) -> dict:
     start, end = bounds[episode_id]
     episode_length = end - start
     first_anchor = max(0, args.start_frame)
-    last_requested = min(episode_length, first_anchor + args.steps)
+    last_requested = episode_length if args.steps is None else min(
+        episode_length, first_anchor + args.steps
+    )
     # Full action horizons only; no target is allowed to cross an episode edge.
     valid_last = max(0, episode_length - horizon + 1)
     if first_anchor >= valid_last:
@@ -495,22 +606,25 @@ def _evaluate_mem0(args, model, dataset, bounds, stats, episode_id: int,
         predictions.append(pred)
         targets.append(target)
         predictions_raw.append(_mem0_denormalize(pred, action_min, action_max))
-        targets_raw.append(_mem0_denormalize(target, action_min, action_max))
+        targets_raw.append(actions_raw[start + offset:start + offset + horizon, :16])
 
     return _save_episode_result(
         output_dir, episode_id, anchors, predictions, targets,
-        predictions_raw, targets_raw,
+        predictions_raw, targets_raw, states_raw, start, last_requested,
+        args.stride, names,
     )
 
 
 @torch.inference_mode()
-def _evaluate_pi05(args, model, dataset, actions_raw, bounds, stats, tokenizer,
-                   episode_id: int, device: torch.device, output_dir: Path,
-                   horizon: int) -> dict:
+def _evaluate_pi05(args, model, dataset, actions_raw, states_raw, bounds, stats,
+                   tokenizer, episode_id: int, device: torch.device,
+                   output_dir: Path, horizon: int, names: list[str]) -> dict:
     start, end = bounds[episode_id]
     episode_length = end - start
     first_anchor = max(0, args.start_frame)
-    last_requested = min(episode_length, first_anchor + args.steps)
+    last_requested = episode_length if args.steps is None else min(
+        episode_length, first_anchor + args.steps
+    )
     valid_last = max(0, episode_length - horizon + 1)
     if first_anchor >= valid_last:
         raise ValueError(f"Episode {episode_id} has no full {horizon}-action window after frame {first_anchor}")
@@ -585,21 +699,66 @@ def _evaluate_pi05(args, model, dataset, actions_raw, bounds, stats, tokenizer,
             )
     return _save_episode_result(
         output_dir, episode_id, anchors, predictions, targets,
-        predictions_raw, targets_raw,
+        predictions_raw, targets_raw, states_raw, start, last_requested,
+        args.stride, names,
     )
 
 
 def _save_episode_result(output_dir: Path, episode_id: int, anchors: list,
                          predictions: list, targets: list,
-                         predictions_raw: list, targets_raw: list) -> dict:
+                         predictions_raw: list, targets_raw: list,
+                         all_states_raw: np.ndarray, episode_start: int,
+                         trajectory_stop: int, stride: int,
+                         names: list[str]) -> dict:
     if not anchors:
         raise RuntimeError(f"No evaluation anchors were generated for episode {episode_id}")
     pred = np.stack(predictions).astype(np.float32)
     target = np.stack(targets).astype(np.float32)
     pred_raw = np.stack(predictions_raw).astype(np.float32)
     target_raw = np.stack(targets_raw).astype(np.float32)
-    metrics = _metrics(pred, target, pred_raw, target_raw)
-    metrics["episode_id"] = int(episode_id)
+    horizon_metrics = _metrics(pred, target, pred_raw, target_raw)
+
+    trajectory_frames, trajectory_pred, trajectory_target = [], [], []
+    trajectory_pred_raw, trajectory_target_raw, trajectory_state_raw = [], [], []
+    for chunk_index, anchor in enumerate(anchors):
+        take = min(stride, pred.shape[1], trajectory_stop - anchor)
+        if take <= 0:
+            continue
+        frame_slice = np.arange(anchor, anchor + take, dtype=np.int64)
+        trajectory_frames.append(frame_slice)
+        trajectory_pred.append(pred[chunk_index, :take])
+        trajectory_target.append(target[chunk_index, :take])
+        trajectory_pred_raw.append(pred_raw[chunk_index, :take])
+        trajectory_target_raw.append(target_raw[chunk_index, :take])
+        trajectory_state_raw.append(
+            all_states_raw[episode_start + anchor:episode_start + anchor + take, :16]
+        )
+    if not trajectory_frames:
+        raise RuntimeError(f"No stitched trajectory was generated for episode {episode_id}")
+    frame_indices = np.concatenate(trajectory_frames)
+    stitched_pred = np.concatenate(trajectory_pred)
+    stitched_target = np.concatenate(trajectory_target)
+    stitched_pred_raw = np.concatenate(trajectory_pred_raw)
+    stitched_target_raw = np.concatenate(trajectory_target_raw)
+    stitched_state_raw = np.concatenate(trajectory_state_raw)
+    trajectory_metrics = _trajectory_metrics(
+        stitched_pred, stitched_target, stitched_pred_raw,
+        stitched_target_raw, stitched_state_raw, names,
+    )
+    plot_path = output_dir / f"episode_{episode_id:05d}.png"
+    _plot_trajectory(
+        frame_indices, stitched_state_raw, stitched_target_raw,
+        stitched_pred_raw, np.asarray(anchors), names, episode_id, plot_path,
+    )
+    metrics = {
+        "episode_id": int(episode_id),
+        "plot": str(plot_path),
+        "trajectory_metrics": trajectory_metrics,
+        "horizon_metrics": horizon_metrics,
+    }
+    metrics_path = output_dir / f"episode_{episode_id:05d}.json"
+    metrics["metrics_file"] = str(metrics_path)
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     np.savez_compressed(
         output_dir / f"episode_{episode_id:05d}.npz",
         anchor_frames=np.asarray(anchors, dtype=np.int64),
@@ -607,14 +766,26 @@ def _save_episode_result(output_dir: Path, episode_id: int, anchors: list,
         targets_model_space=target,
         predictions_raw_actions=pred_raw,
         targets_raw_actions=target_raw,
+        trajectory_frames=frame_indices,
+        trajectory_states_raw=stitched_state_raw,
+        trajectory_predictions_model_space=stitched_pred,
+        trajectory_targets_model_space=stitched_target,
+        trajectory_predictions_raw_actions=stitched_pred_raw,
+        trajectory_targets_raw_actions=stitched_target_raw,
     )
     return metrics
 
 
 def main() -> None:
     args = _parser().parse_args()
-    if args.steps < 1 or args.stride < 1 or args.start_frame < 0:
-        raise ValueError("--steps and --stride must be positive; --start-frame must be nonnegative")
+    if args.steps is not None and args.steps < 1:
+        raise ValueError("--steps must be positive when provided")
+    if args.stride is not None and args.stride < 1:
+        raise ValueError("--stride must be positive when provided")
+    if args.max_episodes is not None and args.max_episodes < 1:
+        raise ValueError("--max-episodes must be positive when provided")
+    if args.start_frame < 0:
+        raise ValueError("--start-frame must be nonnegative")
     if args.sampling_steps < 1:
         raise ValueError("--sampling-steps must be positive")
     torch.manual_seed(args.seed)
@@ -631,6 +802,12 @@ def main() -> None:
     else:
         model, config_values, payload = _load_pi05(args, policy_root, device)
         horizon = int(model.config.action_horizon)
+    args.stride = horizon if args.stride is None else args.stride
+    if args.stride > horizon:
+        raise ValueError(
+            f"--stride ({args.stride}) cannot exceed action horizon ({horizon}); "
+            "otherwise the stitched trajectory would contain gaps"
+        )
 
     if args.task:
         task = args.task
@@ -666,6 +843,9 @@ def main() -> None:
         )
         raw_dataset = dataset.dataset
         bounds = _episode_bounds(raw_dataset, dataset_root)
+        actions_raw, states_raw = _preload_trajectory_vectors(raw_dataset, dataset_root)
+        actions_raw, states_raw = _vectors16(actions_raw), _vectors16(states_raw)
+        names = _action_names(raw_dataset, 16)
         action_stats = raw_dataset.meta.stats["action"]
         if stats_path:
             stats = _load_stats(stats_path)
@@ -683,12 +863,13 @@ def main() -> None:
         # states/actions. Preserve metadata stats for reporting and inverse map.
         _ = action_min, action_max
         tokenizer = None
-        actions_raw = None
     else:
         image_keys = {args.head_camera_key, args.left_camera_key, args.right_camera_key}
         dataset = _load_raw_lerobot(dataset_root, args.video_backend, image_keys)
         bounds = _episode_bounds(dataset, dataset_root)
-        actions_raw = _preload_actions(dataset, dataset_root)
+        actions_raw, states_raw = _preload_trajectory_vectors(dataset, dataset_root)
+        actions_raw, states_raw = _vectors16(actions_raw), _vectors16(states_raw)
+        names = _action_names(dataset, 16)
         if stats_path is None:
             stats = None
         from openpi.models.tokenizer import PaligemmaTokenizer
@@ -704,26 +885,41 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=False)
     print(f"[open-loop] policy={args.policy} checkpoint={_resolve_path(args.checkpoint)}", flush=True)
-    print(f"[open-loop] dataset={dataset_root} episodes={len(bounds)} horizon={horizon} device={device}", flush=True)
+    episode_ids = sorted(bounds) if args.episode_ids is None else args.episode_ids
+    if args.max_episodes is not None:
+        episode_ids = episode_ids[:args.max_episodes]
+    print(
+        f"[open-loop] dataset={dataset_root} available_episodes={len(bounds)} "
+        f"selected_episodes={len(episode_ids)} horizon={horizon} "
+        f"stride={args.stride} device={device}",
+        flush=True,
+    )
     print(f"[open-loop] norm_stats={stats_path or '<dataset stats / unnormalized>'}; output={output_dir}", flush=True)
 
     results = []
-    for episode_id in args.episode_ids:
+    for episode_id in episode_ids:
         if episode_id not in bounds:
             print(f"[open-loop] skipping absent episode {episode_id}", flush=True)
             continue
         if args.policy == "mem0":
             metrics = _evaluate_mem0(
-                args, model, dataset, bounds, stats, episode_id,
-                device, output_dir, horizon,
+                args, model, dataset, actions_raw, states_raw, bounds,
+                episode_id, device, output_dir, horizon, names,
             )
         else:
             metrics = _evaluate_pi05(
-                args, model, dataset, actions_raw, bounds, stats, tokenizer,
-                episode_id, device, output_dir, horizon,
+                args, model, dataset, actions_raw, states_raw, bounds, stats,
+                tokenizer, episode_id, device, output_dir, horizon, names,
             )
         results.append(metrics)
-        print(json.dumps(metrics, indent=2), flush=True)
+        trajectory = metrics["trajectory_metrics"]
+        print(
+            f"[open-loop] episode={episode_id} frames={trajectory['frames']} "
+            f"raw_mse={trajectory['raw_action_mse']:.6g} "
+            f"raw_mae={trajectory['raw_action_mae']:.6g} "
+            f"plot={metrics['plot']}",
+            flush=True,
+        )
 
     if not results:
         raise RuntimeError("None of the requested episode IDs exist in the dataset")
@@ -732,6 +928,21 @@ def main() -> None:
     all_target = np.concatenate([array["targets_model_space"] for array in pred_arrays], axis=0)
     all_pred_raw = np.concatenate([array["predictions_raw_actions"] for array in pred_arrays], axis=0)
     all_target_raw = np.concatenate([array["targets_raw_actions"] for array in pred_arrays], axis=0)
+    all_trajectory_pred = np.concatenate(
+        [array["trajectory_predictions_model_space"] for array in pred_arrays], axis=0
+    )
+    all_trajectory_target = np.concatenate(
+        [array["trajectory_targets_model_space"] for array in pred_arrays], axis=0
+    )
+    all_trajectory_pred_raw = np.concatenate(
+        [array["trajectory_predictions_raw_actions"] for array in pred_arrays], axis=0
+    )
+    all_trajectory_target_raw = np.concatenate(
+        [array["trajectory_targets_raw_actions"] for array in pred_arrays], axis=0
+    )
+    all_trajectory_states_raw = np.concatenate(
+        [array["trajectory_states_raw"] for array in pred_arrays], axis=0
+    )
     summary = {
         "policy": args.policy,
         "checkpoint": str(_resolve_path(args.checkpoint)),
@@ -740,12 +951,25 @@ def main() -> None:
         "action_horizon": horizon,
         "stride": args.stride,
         "seed": args.seed,
-        "metrics": _metrics(all_pred, all_target, all_pred_raw, all_target_raw),
+        "trajectory_metrics": _trajectory_metrics(
+            all_trajectory_pred, all_trajectory_target,
+            all_trajectory_pred_raw, all_trajectory_target_raw,
+            all_trajectory_states_raw, names,
+        ),
+        "horizon_metrics": _metrics(all_pred, all_target, all_pred_raw, all_target_raw),
         "per_episode": results,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     for array in pred_arrays:
         array.close()
+    aggregate = summary["trajectory_metrics"]
+    print(
+        f"[open-loop] aggregate frames={aggregate['frames']} "
+        f"raw_mse={aggregate['raw_action_mse']:.6g} "
+        f"raw_mae={aggregate['raw_action_mae']:.6g} "
+        f"persistence_mse={aggregate['persistence_mse']:.6g}",
+        flush=True,
+    )
     print(f"[open-loop] summary saved to {output_dir / 'summary.json'}", flush=True)
 
 
