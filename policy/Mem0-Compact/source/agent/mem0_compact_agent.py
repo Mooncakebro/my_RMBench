@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from source.models.execution_module.mem0_compact_executor import Mem0CompactExecutor
 from source.models.execution_module.mem0_baseline_executor import Mem0BaselineExecutor
+from source.dataloader.history_context import select_history_positions
 
 EXECUTOR_VARIANTS = {"compact": Mem0CompactExecutor, "baseline": Mem0BaselineExecutor}
 
@@ -46,6 +47,16 @@ class Mem0CompactAgent:
         self.config = cfg
 
         checkpoint_payload = self._load_checkpoint_payload(ckpt_path)
+        checkpoint_config = checkpoint_payload.get("config", {})
+        checkpoint_history = (
+            checkpoint_config.get("history_context", {})
+            if isinstance(checkpoint_config, dict) else {}
+        )
+        if checkpoint_history and not OmegaConf.select(
+                self.config, "history_context", default=None):
+            OmegaConf.update(
+                self.config, "history_context", checkpoint_history, merge=False
+            )
         self._resolve_base_model_path(checkpoint_payload)
 
         task_name = self.config.get("task_name", "unknown_task")
@@ -78,6 +89,21 @@ class Mem0CompactAgent:
         self._last_summary: Optional[torch.Tensor] = None
         self._last_state: Optional[torch.Tensor] = None
         self._time_action_history: Dict[int, list] = {}
+        history_config = OmegaConf.select(
+            self.config, "history_context", default=None
+        )
+        if OmegaConf.is_config(history_config):
+            history_config = OmegaConf.to_container(history_config, resolve=True)
+        self.history_context = dict(history_config or {})
+        self.independent_history = bool(self.history_context.get("enabled", False))
+        self.history_lookback_frames = max(
+            1,
+            int(round(float(self.history_context.get("lookback_seconds", 20.0))
+                      * float(self.history_context.get("fps", 30.0)))),
+        )
+        self._history_position = -1
+        self._initial_image = None
+        self._history_buffer = []
 
         self.variant = self._resolve_variant(checkpoint_payload)
         cprint(f"[Mem0-Compact] executor variant: {self.variant}", "red")
@@ -330,15 +356,54 @@ class Mem0CompactAgent:
         subtask-end probability crosses its threshold (idea.md: memory is
         NOT reset here — only the eval loop reacts).
         """
-        images = [[obs_payload["image"]]]
+        current_image = obs_payload["image"]
+        if self.independent_history:
+            self._history_position += 1
+            if self._history_position == 0:
+                self._initial_image = current_image
+            self._history_buffer.append((self._history_position, current_image))
+            oldest = max(1, self._history_position - self.history_lookback_frames)
+            self._history_buffer = [
+                (position, image) for position, image in self._history_buffer
+                if position >= oldest
+            ]
+            positions = select_history_positions(
+                self._history_position,
+                self.history_lookback_frames,
+                int(self.history_context.get("num_history_frames", 4)),
+                bool(self.history_context.get("include_initial_frame", True)),
+            )
+            frame_map = dict(self._history_buffer)
+            context_images = []
+            for position in positions:
+                if position == 0 and self._initial_image is not None:
+                    context_images.append(self._initial_image)
+                    continue
+                if position in frame_map:
+                    context_images.append(frame_map[position])
+            if not context_images or context_images[-1] is not current_image:
+                context_images.append(current_image)
+            images = [context_images]
+        else:
+            images = [[current_image]]
         instructions = [obs_payload.get("instruction", self.instruction)]
         state = torch.from_numpy(
             np.asarray(obs_payload["state"], dtype=np.float32)).reshape(1, 1, 16)
 
-        if self.memory is None:
-            # Episode start: fresh memory, zero prev-action.
+        if self.independent_history or self.memory is None:
+            # v3 starts fresh COMPACT memory per observation; prev_action still
+            # follows the training convention and is zero only at episode start.
             self.memory = self.executor.init_memory(1, self.device)
-            prev_action = torch.zeros(1, 16, dtype=torch.float32)
+            if self.independent_history:
+                prev_action = (
+                    torch.zeros(1, 16, dtype=torch.float32, device=self.device)
+                    if self._history_position == 0
+                    else state.reshape(1, 16).clone().to(self.device)
+                )
+            else:
+                prev_action = torch.zeros(
+                    1, 16, dtype=torch.float32, device=self.device
+                )
         else:
             prev_action = state.reshape(1, 16).clone()
 
@@ -406,6 +471,9 @@ class Mem0CompactAgent:
         self.end_signal_count = 0
         self.stage = 0
         self._time_action_history = {}
+        self._history_position = -1
+        self._initial_image = None
+        self._history_buffer = []
         self._last_summary = None
         self._last_state = None
         self.is_init = 0

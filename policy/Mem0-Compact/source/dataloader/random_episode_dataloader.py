@@ -44,6 +44,7 @@ import numpy as np
 from torch.utils.data import IterableDataset, get_worker_info
 from termcolor import cprint
 from source.utils import BOLD, RESET_BOLD
+from source.dataloader.history_context import select_history_positions
 
 
 class RandomEpisodeIterableDataset(IterableDataset):
@@ -80,6 +81,7 @@ class RandomEpisodeIterableDataset(IterableDataset):
         infinite: bool = True,
         episode_ids: Optional[List[int]] = None,
         episode_to_indices: Optional[Dict[int, List[int]]] = None,
+        history_context: Optional[Dict] = None,
     ):
         """
         Initialize RandomEpisodeIterableDataset.
@@ -98,6 +100,18 @@ class RandomEpisodeIterableDataset(IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.infinite = infinite
+        self.history_context = dict(history_context or {})
+        self.history_enabled = bool(self.history_context.get("enabled", False))
+        self.history_span_seconds = float(self.history_context.get("lookback_seconds", 20.0))
+        self.history_num_frames = int(self.history_context.get("num_history_frames", 4))
+        self.history_include_initial = bool(self.history_context.get("include_initial_frame", True))
+        self.history_fps = float(self.history_context.get("fps", 30.0))
+        if (self.history_span_seconds <= 0 or self.history_num_frames < 0
+                or self.history_fps <= 0):
+            raise ValueError(
+                "history_context requires positive lookback_seconds/fps and "
+                "nonnegative num_history_frames"
+            )
         self.requested_episode_ids = (
             set(int(episode_id) for episode_id in episode_ids)
             if episode_ids is not None else None
@@ -385,6 +399,8 @@ class RandomEpisodeIterableDataset(IterableDataset):
         
         def _gen():
             cycle_count = 0
+            image_cache = {}
+            active_episode = None
             while True:
                 # Each cycle: shuffle only the fixed episodes assigned to this worker
                 # This maintains randomness while preventing episode overlap
@@ -407,13 +423,45 @@ class RandomEpisodeIterableDataset(IterableDataset):
                 for episode_id in worker_episodes:
                     # Get frame indices for this episode (already sorted)
                     frame_indices = self.episode_to_indices[episode_id]
+                    if active_episode != episode_id:
+                        image_cache.clear()
+                        active_episode = episode_id
                     
                     # Sequentially yield frames from this episode
-                    for idx in frame_indices:
+                    for episode_pos, idx in enumerate(frame_indices):
                         try:
                             sample = self.base_dataset[idx]
                             # Filter out samples with lang == "null"
                             if sample.get("lang") != "null":
+                                if self.history_enabled:
+                                    image_cache[idx] = sample["image"][0]
+                                    lookback = max(
+                                        1,
+                                        int(round(self.history_span_seconds * self.history_fps)),
+                                    )
+                                    selected_positions = select_history_positions(
+                                        episode_pos, lookback, self.history_num_frames,
+                                        self.history_include_initial,
+                                    )
+
+                                    context_images = []
+                                    for position in selected_positions:
+                                        frame_idx = frame_indices[position]
+                                        if frame_idx not in image_cache:
+                                            history_sample = self.base_dataset[frame_idx]
+                                            image_cache[frame_idx] = history_sample["image"][0]
+                                        context_images.append(image_cache[frame_idx])
+                                    sample["image"] = context_images
+                                    sample["history_frame_indices"] = selected_positions
+
+                                    cache_floor = max(1, episode_pos - lookback)
+                                    stale = [
+                                        frame_idx for frame_idx in image_cache
+                                        if frame_idx != frame_indices[0]
+                                        and frame_idx < frame_indices[cache_floor]
+                                    ]
+                                    for frame_idx in stale:
+                                        del image_cache[frame_idx]
                                 yield sample
                         except Exception as e:
                             if self.rank == 0 and current_worker_id == 0:

@@ -550,7 +550,7 @@ def _plot_trajectory(frame_indices: np.ndarray, state_raw: np.ndarray,
 @torch.inference_mode()
 def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
                    episode_id: int, device: torch.device, output_dir: Path,
-                   horizon: int, names: list[str]) -> dict:
+                   horizon: int, names: list[str], history_config: dict | None = None) -> dict:
     start, end = bounds[episode_id]
     episode_length = end - start
     first_anchor = max(0, args.start_frame)
@@ -566,6 +566,18 @@ def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
         raise ValueError(f"Episode {episode_id} has no eligible frames")
 
     memory = model.init_memory(1, device)
+    history_config = history_config or {}
+    independent_history = bool(history_config.get("enabled", False))
+    history_lookback = max(
+        1,
+        int(round(float(history_config.get("lookback_seconds", 20.0))
+                  * float(history_config.get("fps", 30.0)))),
+    )
+    history_count = int(history_config.get("num_history_frames", 4))
+    include_initial = bool(history_config.get("include_initial_frame", True))
+    from source.dataloader.history_context import select_history_positions
+    history_cache = {}
+    initial_image = None
     previous_episode_start = True
     anchors, predictions, targets, predictions_raw, targets_raw = [], [], [], [], []
     action_min = getattr(dataset, "action_min", None)
@@ -581,13 +593,36 @@ def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
         sample = dataset[start + offset]
         state = torch.as_tensor(sample["state"], dtype=torch.float32).reshape(1, 16).to(device)
         image = sample["image"][0]
+        if independent_history:
+            if offset == 0:
+                initial_image = image
+            history_cache[offset] = image
+            selected = select_history_positions(
+                offset, history_lookback, history_count, include_initial
+            )
+            context_images = []
+            for history_pos in selected:
+                if history_pos == 0 and initial_image is not None:
+                    context_images.append(initial_image)
+                elif history_pos in history_cache:
+                    context_images.append(history_cache[history_pos])
+            image_payload = [context_images]
+            if offset > 0:
+                oldest = max(1, offset - history_lookback)
+                history_cache = {
+                    position: frame for position, frame in history_cache.items()
+                    if position >= oldest
+                }
+            memory = model.init_memory(1, device)
+        else:
+            image_payload = [[image]]
         instruction = _instruction({"subtask": sample.get("lang", "")}, "mem0", args.instruction)
         # Match Mem0 training: prev_action is the current normalized state,
         # with a zero vector only on the first frame of each episode.
         prev_action = torch.zeros_like(state) if previous_episode_start else state.clone()
         previous_episode_start = False
         batch = {
-            "image": [[image]],
+            "image": image_payload,
             "lang": [instruction],
             "state": state[:, None, :],
             "prev_action": prev_action,
@@ -905,6 +940,8 @@ def main() -> None:
             metrics = _evaluate_mem0(
                 args, model, dataset, actions_raw, states_raw, bounds,
                 episode_id, device, output_dir, horizon, names,
+                history_config=(model_cfg.get("history_context", {})
+                                if hasattr(model_cfg, "get") else {}),
             )
         else:
             metrics = _evaluate_pi05(
