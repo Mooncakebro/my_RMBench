@@ -20,6 +20,8 @@ from omegaconf import OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MEM0_ROOT = REPO_ROOT / "policy" / "Mem-0"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _parse_args():
