@@ -53,3 +53,5 @@ policy/Pi05-Compact/lerobot_datasets/
 # !policy/Pi05-Compact/assets/
 # !policy/Pi05-Compact/assets/**/
 # !policy/Pi05-Compact/assets/**/*.json
+
+policy/Mem-0/released/
