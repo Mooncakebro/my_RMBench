@@ -123,7 +123,10 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
             image_feature, text_feature, model.classifier, episode_id=memory_id
         )
         summary = torch.cat((fused, anchor, text_feature), dim=1)
-        state = torch.as_tensor(sample["state"], dtype=fused.dtype, device=device).reshape(1, 1, 16)
+        state_dtype = model.action_model.state_encoder.layer1.weight.dtype
+        state = torch.as_tensor(
+            sample["state"], dtype=state_dtype, device=device
+        ).reshape(1, 1, 16)
 
         if offset < first_anchor or (offset - first_anchor) % stride:
             continue
