@@ -576,12 +576,16 @@ def main():
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
     num_workers = (args.num_workers if args.num_workers is not None else int(
         cfg.get("dataloader", {}).get("num_workers", 0)))
-    if variant == "compact" and num_workers > 1:
+    history_independent = bool(
+        cfg.get("history_context", {}).get("enabled", False)
+    )
+    if variant == "compact" and num_workers > 1 and not history_independent:
         destroy_distributed()
         raise ValueError(
             "COMPACT recurrent training requires --num-workers 0 or 1. "
             "Multiple DataLoader workers interleave different episodes and reset "
-            "the batch-slot memory instead of preserving frame continuity."
+            "the batch-slot memory instead of preserving frame continuity. "
+            "Multiple workers are supported when history_context.enabled=true."
         )
     log_interval = int(trainer_cfg.get("log_interval", 5))
     save_every = int(trainer_cfg.get("save_every_steps", 0))
@@ -798,9 +802,6 @@ def main():
     prev_episode = torch.full((batch_size,), -1, dtype=torch.long, device=device)
     total_iters = max_steps * window_size * grad_accum_windows
 
-    history_independent = bool(
-        cfg.get("history_context", {}).get("enabled", False)
-    )
     rank0_print(f"[train] mode={'independent history windows' if history_independent else 'TBPTT'}, "
                 f"window_size={window_size}, accum_windows="
                 f"{grad_accum_windows}, optimizer_steps={max_steps}, "
