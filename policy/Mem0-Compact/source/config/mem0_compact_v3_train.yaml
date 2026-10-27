@@ -62,9 +62,9 @@ execution_module:
 # approximately 600 frames.
 history_context:
   enabled: true
-  lookback_seconds: 20.0
+  lookback_seconds: 1.0
   fps: 30
-  num_history_frames: 4
+  num_history_frames: 16
   include_initial_frame: true
 
 # In v3, window_size is the number of independent context examples grouped
