@@ -21,7 +21,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 class Qwen3VL_Encapsulation(nn.Module):
-    def __init__(self, model_path: str, device: Optional[torch.device] = None, **kwargs):
+    def __init__(self, model_path: str, device: Optional[torch.device] = None,
+                 attn_implementation: str = "sdpa", **kwargs):
         """
         Initialize the Qwen3-VL wrapper.
         """
@@ -34,7 +35,7 @@ class Qwen3VL_Encapsulation(nn.Module):
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             device_map=device_map,
         )
         self.processor = AutoProcessor.from_pretrained(model_path)

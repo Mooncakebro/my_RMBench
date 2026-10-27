@@ -71,7 +71,11 @@ class MemoryMattersExecutor(nn.Module):
         # ---    model definition      ---
         # --------------------------------
         # set qwen vl model
-        self.qwen_model = Qwen3VL_Encapsulation(model_path, device=device)
+        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        self.qwen_model = Qwen3VL_Encapsulation(
+            model_path, device=device,
+            attn_implementation=attn_implementation,
+        )
         # set memory bank
         self.memory_bank = MemoryBank(
             hidden_dim=self.qwen_model.hidden_size,
