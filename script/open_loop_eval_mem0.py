@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,8 @@ def _parse_args():
     parser.add_argument("--config", type=Path,
                         default=MEM0_ROOT / "source/config/execution_module_train.yaml")
     parser.add_argument("--dataset", type=Path, required=True,
-                        help="LeRobot dataset directory for one M1 task")
+                        help="LeRobot dataset directory or original RMBench task/demo/data directory")
+    parser.add_argument("--dataset-format", choices=("auto", "lerobot", "raw"), default="auto")
     parser.add_argument("--norm-stats", type=Path, default=None,
                         help="optional training normalization JSON")
     parser.add_argument("--base-model", type=str, default=None,
@@ -57,14 +59,15 @@ def _load_model(args, device):
     cfg = OmegaConf.load(config_path)
     if args.base_model:
         cfg.execution_module.qwen_vl.model_path = args.base_model
-    # The upstream executor uses FlashAttention2 unconditionally and creates
-    # the VLM in bf16. Keep its original architecture/inference implementation.
+    # The upstream wrapper defaults to SDPA and creates the VLM in bf16.
     sys.path.insert(0, str(MEM0_ROOT))
     from source.models.execution_module.memorymatters_executor import MemoryMattersExecutor
 
     model = MemoryMattersExecutor(cfg, device=device).to(device)
     checkpoint_path = args.checkpoint.expanduser().resolve()
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # The release includes optimizer moments (~15 GB). Map them instead of
+    # materializing unused optimizer storage in RAM on evaluation machines.
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError("Expected a Mem-0 checkpoint mapping")
     state = payload.get("model_state_dict", payload.get("model", payload.get("state_dict")))
@@ -77,6 +80,7 @@ def _load_model(args, device):
             f"unexpected={len(unexpected)} {unexpected[:8]}"
         )
     model.eval()
+    print(f"[open-loop] checkpoint loaded (missing=0 unexpected=0)", flush=True)
     return model, cfg
 
 
@@ -89,9 +93,13 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
     valid_last = max(0, episode_length - horizon + 1)
     if first_anchor >= valid_last:
         raise ValueError(f"Episode {episode_id} has no complete {horizon}-action horizon")
-    stop = episode_length if args.steps is None else min(episode_length, first_anchor + args.steps)
-    stop = min(stop, valid_last)
+    trajectory_stop = episode_length if args.steps is None else min(episode_length, first_anchor + args.steps)
+    stop = min(trajectory_stop, valid_last)
     stride = args.stride
+    anchor_offsets = set(range(first_anchor, stop, stride))
+    # A final full horizon covers the remaining tail without padded targets.
+    if trajectory_stop > max(anchor_offsets) + horizon:
+        anchor_offsets.add(trajectory_stop - horizon)
     anchors, preds, targets, preds_raw, targets_raw = [], [], [], [], []
     memory_id = int(episode_id)
     model.memory_bank.reset([memory_id])
@@ -104,9 +112,11 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
     action_min = helpers._vector16(action_min)
     action_max = helpers._vector16(action_max)
 
+    began = time.monotonic()
     for offset in range(stop):
         sample = dataset[start + offset]
-        image = sample["image"][0]
+        # Match official closed-loop preprocessing (no training ColorJitter).
+        image = sample["image"][0].resize((224, 224))
         instruction = args.instruction if args.instruction is not None else str(sample["lang"])
         qwen_inputs = model.qwen_model.build_qwenvl_inputs(
             [[image]], [instruction], system_prompt=None,
@@ -114,7 +124,7 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
         )
         outputs = model.qwen_model(
             **qwen_inputs, output_attentions=False,
-            output_hidden_states=True, return_dict=True,
+            output_hidden_states=True, return_dict=True, use_cache=False,
         )
         image_feature, text_feature = model.qwen_model.extract_features(
             qwen_inputs.input_ids, outputs.hidden_states[-1]
@@ -122,13 +132,13 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
         fused, anchor, _ = model.memory_bank.update_on_eval(
             image_feature, text_feature, model.classifier, episode_id=memory_id
         )
-        summary = torch.cat((fused, anchor, text_feature), dim=1)
         state_dtype = model.action_model.state_encoder.layer1.weight.dtype
+        summary = torch.cat((fused, anchor, text_feature), dim=1).to(state_dtype)
         state = torch.as_tensor(
             sample["state"], dtype=state_dtype, device=device
         ).reshape(1, 1, 16)
 
-        if offset < first_anchor or (offset - first_anchor) % stride:
+        if offset not in anchor_offsets:
             continue
         prediction = model.action_model.predict_action(summary, state)[0].float().cpu().numpy()
         target = torch.as_tensor(sample["action"], dtype=torch.float32).cpu().numpy()
@@ -140,10 +150,13 @@ def _eval_episode(args, model, dataset, raw_actions, raw_states, bounds,
         targets.append(target)
         preds_raw.append(helpers._mem0_denormalize(prediction, action_min, action_max))
         targets_raw.append(raw_actions[start + offset:start + offset + horizon, :16])
+        if len(anchors) == 1 or len(anchors) % 10 == 0:
+            print(f"[open-loop] episode={episode_id} frame={offset}/{stop} "
+                  f"anchors={len(anchors)} elapsed={time.monotonic() - began:.1f}s", flush=True)
 
     return helpers._save_episode_result(
         output_dir, episode_id, anchors, preds, targets, preds_raw, targets_raw,
-        raw_states, start, stop, stride, names,
+        raw_states, start, trajectory_stop, stride, names, cover_tail=True,
     )
 
 
@@ -153,6 +166,8 @@ def main():
         raise ValueError("start-frame must be nonnegative and steps must be positive")
     if args.stride is not None and args.stride < 1:
         raise ValueError("stride must be positive")
+    if args.max_episodes is not None and args.max_episodes < 1:
+        raise ValueError("max-episodes must be positive")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
@@ -163,25 +178,34 @@ def main():
         raise ValueError("stride cannot exceed action horizon because that leaves gaps")
 
     sys.path.insert(0, str(MEM0_ROOT))
-    from source.dataloader.dataset_min_max import LeRobot_Dataset
     from script import open_loop_eval_compact as helpers
 
     dataset_root = args.dataset.expanduser().resolve()
     norm_stats = args.norm_stats.expanduser().resolve() if args.norm_stats else None
-    dataset = LeRobot_Dataset(
-        repo_id=dataset_root.name, root=str(dataset_root),
-        features_to_load=["observation.state", "action", "subtask", "subtask_end",
-                          "episode_id", "observation.image.head_camera"],
-        action_horizon=horizon,
-        image_scale=None,
-        norm_stats_path=str(norm_stats) if norm_stats else None,
-        video_backend=args.video_backend,
+    is_raw = args.dataset_format == "raw" or (
+        args.dataset_format == "auto" and not (dataset_root / "meta/info.json").is_file()
     )
-    raw_dataset = dataset.dataset
-    bounds = helpers._episode_bounds(raw_dataset, dataset_root)
-    raw_actions, raw_states = helpers._preload_trajectory_vectors(raw_dataset, dataset_root)
-    raw_actions, raw_states = helpers._vectors16(raw_actions), helpers._vectors16(raw_states)
-    names = helpers._action_names(raw_dataset, 16)
+    if is_raw:
+        from script.open_loop_raw_mem0 import RawMem0Dataset
+        dataset = RawMem0Dataset(dataset_root, args.task, horizon, norm_stats,
+                                 args.episode_ids, args.max_episodes, args.instruction)
+        bounds = dataset.bounds
+        raw_actions, raw_states, names = dataset.raw_actions, dataset.raw_states, dataset.names
+    else:
+        from source.dataloader.dataset_min_max import LeRobot_Dataset
+        dataset = LeRobot_Dataset(
+            repo_id=dataset_root.name, root=str(dataset_root),
+            features_to_load=["observation.state", "action", "subtask", "subtask_end",
+                              "episode_id", "observation.image.head_camera"],
+            action_horizon=horizon, image_scale=None,
+            norm_stats_path=str(norm_stats) if norm_stats else None,
+            video_backend=args.video_backend,
+        )
+        raw_dataset = dataset.dataset
+        bounds = helpers._episode_bounds(raw_dataset, dataset_root)
+        raw_actions, raw_states = helpers._preload_trajectory_vectors(raw_dataset, dataset_root)
+        raw_actions, raw_states = helpers._vectors16(raw_actions), helpers._vectors16(raw_states)
+        names = helpers._action_names(raw_dataset, 16)
 
     output_dir = args.output_dir.expanduser().resolve() / (
         f"mem0_{args.task}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -217,6 +241,10 @@ def main():
         "episodes": [item["episode_id"] for item in results],
         "action_horizon": horizon,
         "stride": args.stride,
+        "dataset_format": "raw" if is_raw else "lerobot",
+        "seed": args.seed,
+        "instruction": dataset.instruction if is_raw else args.instruction,
+        "image_size": [224, 224],
         "trajectory_metrics": helpers._trajectory_metrics(
             concat("trajectory_predictions_model_space"),
             concat("trajectory_targets_model_space"),

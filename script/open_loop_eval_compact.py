@@ -744,7 +744,7 @@ def _save_episode_result(output_dir: Path, episode_id: int, anchors: list,
                          predictions_raw: list, targets_raw: list,
                          all_states_raw: np.ndarray, episode_start: int,
                          trajectory_stop: int, stride: int,
-                         names: list[str]) -> dict:
+                         names: list[str], cover_tail: bool = False) -> dict:
     if not anchors:
         raise RuntimeError(f"No evaluation anchors were generated for episode {episode_id}")
     pred = np.stack(predictions).astype(np.float32)
@@ -756,7 +756,9 @@ def _save_episode_result(output_dir: Path, episode_id: int, anchors: list,
     trajectory_frames, trajectory_pred, trajectory_target = [], [], []
     trajectory_pred_raw, trajectory_target_raw, trajectory_state_raw = [], [], []
     for chunk_index, anchor in enumerate(anchors):
-        take = min(stride, pred.shape[1], trajectory_stop - anchor)
+        next_anchor = anchors[chunk_index + 1] if chunk_index + 1 < len(anchors) else trajectory_stop
+        interval = next_anchor - anchor if cover_tail else stride
+        take = min(interval, pred.shape[1], trajectory_stop - anchor)
         if take <= 0:
             continue
         frame_slice = np.arange(anchor, anchor + take, dtype=np.int64)
