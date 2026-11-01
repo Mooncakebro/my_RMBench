@@ -136,11 +136,19 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/baseline_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
-# 8 GPUs: set CUDA_VISIBLE_DEVICES and NPROC=8. BATCH_SIZE is per GPU. For
-# Compact, keep BATCH_SIZE=1 and use detached TBPTT-window accumulation when a
-# larger effective update is required. `window_size=8` and
-# `grad_accum_windows=7` expose 1 x 8 x 7 x 8 = 448 frames globally per
-# optimizer update, while gradients still stop every 8 frames.
+# BATCH_SIZE is the total per-rank batch. For recurrent COMPACT, the loader
+# creates independent episode streams per batch slot, so each row advances by
+# one frame per forward. With multiple workers, batch_size must be divisible by
+# num_workers; worker microbatches are merged in a stable row order. For example
+# BATCH_SIZE=32 and num_workers=4 means 8 streams per worker, merged to 32 rows.
+# `window_size=4` and `grad_accum_windows=2` process 8 sequential frames per
+# optimizer update while detaching memory gradients every 4 frames.
+# Example v2 scale-up (adjust BATCH_SIZE to fit VRAM; requires BATCH_SIZE >= 4):
+CONFIG=source/config/mem0_compact_train.yaml \
+  CUDA_VISIBLE_DEVICES=2,3,4,5 NPROC=4 TASK=swap_blocks \
+  BATCH_SIZE=8 GRAD_ACCUM_WINDOWS=1 MAX_STEPS=30000 \
+  EXTRA_ARGS="--window-size 4 --num-workers 4 --grad-ckpt 1" \
+  bash source/training/train_ddp.sh
 # Checkpoint policy:
 #   - after step 1000, save_best=true overwrites ckpt_best.pt whenever the
 #     fixed-seed, episode-disjoint validation action loss reaches a new minimum
@@ -200,7 +208,8 @@ CONFIG=source/config/mem0_baseline_train.yaml \
 #     window_size x grad_accum_windows
 #   - memory state (M, P, e) is per-rank; no cross-rank coupling
 #   - accumulated update loss is averaged across ranks for logging only
-#   - keep `--num-workers 1`; multiple workers can break per-slot temporal order
+#   - multiple workers are supported: each owns a stable set of batch slots;
+#     their microbatches are merged before forward so memory rows remain aligned
 #   - single-GPU multi-rank debugging auto-falls back to gloo+cpu
 #     (NCCL refuses two ranks on one physical device)
 #   - DDP smoke test (tiny model, no VLM):

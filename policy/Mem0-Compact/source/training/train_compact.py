@@ -3,8 +3,8 @@ Mem0-Compact TBPTT training loop (single-process by default; DDP auto-enabled
 under torchrun).
 
 Per idea.md §3:
-  - frames iterate sequentially within episodes via RandomEpisodeIterableDataset
-    (episodes sharded per rank: episode % world_size == rank)
+  - each batch row owns an independent episode stream and advances exactly one
+    frame per forward; episodes are sharded by rank and then by DataLoader worker
   - memory (M, P, e per layer) + prev_action are threaded across batches and
     are per-sample / rank-local — no cross-rank coupling
   - loss accumulates over a K-frame window; ONE backward per window
@@ -27,7 +27,8 @@ DDP notes:
   - single-GPU runs are not wrapped in DDP; multi-GPU runs use
     find_unused_parameters=True because episode-start frames can legitimately
     omit gradients for zero-input branches.
-  - per-rank batch_size is the config value; global batch = batch * world_size.
+  - per-rank batch_size is the merged batch; global batch = batch * world_size.
+  - worker microbatches are merged in stable worker/row order before forward.
   - checkpointing/logging are rank-0-only; update loss is all-reduced for logs.
 
 Example (single process):
@@ -92,7 +93,44 @@ def collate_batch(samples: list) -> dict:
     batch["episode_id"] = torch.tensor([int(s["episode_id"]) for s in samples])
     batch["subtask_end"] = torch.tensor([int(s["subtask_end"]) for s in samples])
     batch["episode_pos"] = torch.tensor([int(s["episode_pos"]) for s in samples])
+    stream_ids = {int(s.get("stream_id", 0)) for s in samples}
+    if len(stream_ids) != 1:
+        raise ValueError(f"DataLoader batch mixed worker streams: {sorted(stream_ids)}")
+    batch["stream_id"] = stream_ids.pop()
     return batch
+
+
+def merge_worker_batches(loader, num_workers: int):
+    """Merge one ordered microbatch from each worker into one rank batch.
+
+    Each IterableDataset worker owns a stable slice of batch slots and yields
+    its own episode-contiguous stream. Merging by worker id restores a fixed
+    memory-row layout before the recurrent model sees a batch.
+    """
+    if num_workers <= 0:
+        yield from loader
+        return
+
+    pending = {}
+    for batch in loader:
+        stream_id = int(batch.pop("stream_id"))
+        if stream_id in pending:
+            raise RuntimeError(f"worker {stream_id} emitted two batches before peers")
+        pending[stream_id] = batch
+        if len(pending) == num_workers:
+            missing = set(range(num_workers)) - set(pending)
+            if missing:
+                raise RuntimeError(
+                    f"DataLoader worker batch cycle is incomplete; missing {sorted(missing)}"
+                )
+            ordered = [pending.pop(worker_id) for worker_id in range(num_workers)]
+            merged = {"image": [], "lang": []}
+            merged["image"] = [item for part in ordered for item in part["image"]]
+            merged["lang"] = [item for part in ordered for item in part["lang"]]
+            for key in ordered[0]:
+                if key not in ("image", "lang"):
+                    merged[key] = torch.cat([part[key] for part in ordered], dim=0)
+            yield merged
 
 
 def parse_args():
@@ -112,7 +150,7 @@ def parse_args():
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--window-size", type=int, default=None,
-                   help="frames per TBPTT window; independent examples per update in v3 history mode")
+                   help="sequential recurrent frames per TBPTT backward window")
     p.add_argument("--grad-accum-windows", type=int, default=None,
                    help="number of detached TBPTT windows accumulated per "
                         "optimizer update (default: 1)")
@@ -229,6 +267,16 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         episode_to_indices = getattr(base_dataset, "episode_to_indices", None)
     if history_context is None:
         history_context = cfg.get("history_context", {})
+    if num_workers > 0:
+        if batch_size < num_workers or batch_size % num_workers:
+            raise ValueError(
+                "For recurrent multi-worker loading, per-rank batch_size must "
+                "be divisible by num_workers and at least as large as it. "
+                f"Got batch_size={batch_size}, num_workers={num_workers}."
+            )
+        worker_batch_size = batch_size // num_workers
+    else:
+        worker_batch_size = batch_size
     iterable = RandomEpisodeIterableDataset(
         base_dataset=base_dataset,
         rank=rank, world_size=world_size,
@@ -238,9 +286,13 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         episode_ids=list(episode_ids) if episode_ids is not None else None,
         episode_to_indices=episode_to_indices,
         history_context=history_context,
+        stream_batch_size=worker_batch_size,
     )
     loader_kwargs = {
-        "batch_size": batch_size,
+        # The iterable emits one already-aligned temporal microbatch per
+        # worker. Its slots are independent episodes and advance one frame
+        # together on each iteration.
+        "batch_size": None,
         "num_workers": num_workers,
         "collate_fn": collate_batch,
     }
@@ -576,17 +628,10 @@ def main():
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
     num_workers = (args.num_workers if args.num_workers is not None else int(
         cfg.get("dataloader", {}).get("num_workers", 0)))
-    history_independent = bool(
-        cfg.get("history_context", {}).get("enabled", False)
-    )
-    if variant == "compact" and num_workers > 1 and not history_independent:
-        destroy_distributed()
-        raise ValueError(
-            "COMPACT recurrent training requires --num-workers 0 or 1. "
-            "Multiple DataLoader workers interleave different episodes and reset "
-            "the batch-slot memory instead of preserving frame continuity. "
-            "Multiple workers are supported when history_context.enabled=true."
-        )
+    history_cfg = cfg.get("history_context", {})
+    history_enabled = bool(history_cfg.get("enabled", False))
+    carry_memory = bool(history_cfg.get("carry_memory", not history_enabled))
+    history_independent = history_enabled and not carry_memory
     log_interval = int(trainer_cfg.get("log_interval", 5))
     save_every = int(trainer_cfg.get("save_every_steps", 0))
     save_best = bool(trainer_cfg.get("save_best", False))
@@ -766,6 +811,15 @@ def main():
         raise ValueError("episode split left no training episodes")
     if validation_enabled and not validation_episode_ids:
         raise ValueError("validation split contains no episodes")
+    local_train_episode_count = sum(
+        1 for episode_id in train_episode_ids if episode_id % world_size == rank
+    )
+    if batch_size > local_train_episode_count:
+        raise ValueError(
+            f"per-rank batch_size={batch_size} exceeds this rank's "
+            f"{local_train_episode_count} training episodes; each recurrent "
+            "batch slot needs its own episode stream."
+        )
 
     loader = build_dataloader(
         cfg, args.task, rank=rank, world_size=world_size,
@@ -794,7 +848,7 @@ def main():
                 f"[val] interval={validation_interval} updates, "
                 f"max_frames_per_rank={validation_max_frames or 'all'}"
             )
-    data_iter = iter(loader)
+    data_iter = iter(merge_worker_batches(loader, num_workers))
 
     # ── TBPTT state (per-rank, no cross-rank coupling) ──
     model.train()
@@ -802,7 +856,12 @@ def main():
     prev_episode = torch.full((batch_size,), -1, dtype=torch.long, device=device)
     total_iters = max_steps * window_size * grad_accum_windows
 
-    rank0_print(f"[train] mode={'independent history windows' if history_independent else 'TBPTT'}, "
+    mode = (
+        "stateless history ablation" if history_independent
+        else "recurrent COMPACT + history" if history_enabled
+        else "recurrent COMPACT (v2)"
+    )
+    rank0_print(f"[train] mode={mode}, "
                 f"window_size={window_size}, accum_windows="
                 f"{grad_accum_windows}, optimizer_steps={max_steps}, "
                 f"batch={batch_size}x{world_size}, frames={total_iters}")
@@ -841,7 +900,7 @@ def main():
                     try:
                         batch = next(data_iter)
                     except StopIteration:
-                        data_iter = iter(loader)
+                        data_iter = iter(merge_worker_batches(loader, num_workers))
                         batch = next(data_iter)
                     if profiling:
                         profile_times["data"] += time.perf_counter() - phase_start

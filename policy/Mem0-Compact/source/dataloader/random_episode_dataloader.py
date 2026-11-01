@@ -4,8 +4,8 @@
 """
 Random Episode Iterable Dataset Loader
 
-This module provides an IterableDataset that randomly selects episodes per rank
-and sequentially reads frames within each episode. This ensures that:
+This module provides an IterableDataset that assigns independent recurrent
+streams to batch slots and advances each stream one frame per yield. This ensures that:
 - Each rank is assigned a specific set of episodes (episode % world_size == rank)
 - Episodes are randomly shuffled per rank
 - Frames are read sequentially within each episode
@@ -16,7 +16,8 @@ Key Features:
 - Episode-level sharding: Episodes are never split across ranks
 - Random episode selection: Episodes are randomly shuffled per rank
 - Sequential frame reading: Frames within each episode are read in order
-- Batch compatibility: Works with MemoryBank's episode transition handling
+- Batch slots remain temporally contiguous even when batch_size > 1
+- Worker-produced microbatches can be merged in a stable order by the trainer
 
 Usage:
     >>> from source.dataloader.random_episode_dataloader import RandomEpisodeIterableDataset
@@ -31,7 +32,7 @@ Usage:
     ...     shuffle=True,
     ...     seed=42
     ... )
-    >>> dataloader = DataLoader(iterable_dataset, batch_size=16, num_workers=4)  # Supports multiple workers
+    >>> dataloader = DataLoader(iterable_dataset, batch_size=None, num_workers=4)
 """
 import os
 import sys
@@ -68,7 +69,7 @@ class RandomEpisodeIterableDataset(IterableDataset):
         ...     shuffle=True,
         ...     seed=42
         ... )
-        >>> dataloader = DataLoader(iterable_dataset, batch_size=16, num_workers=4)  # Supports multiple workers
+    >>> dataloader = DataLoader(iterable_dataset, batch_size=None, num_workers=4)
     """
     
     def __init__(
@@ -82,6 +83,7 @@ class RandomEpisodeIterableDataset(IterableDataset):
         episode_ids: Optional[List[int]] = None,
         episode_to_indices: Optional[Dict[int, List[int]]] = None,
         history_context: Optional[Dict] = None,
+        stream_batch_size: Optional[int] = None,
     ):
         """
         Initialize RandomEpisodeIterableDataset.
@@ -106,6 +108,11 @@ class RandomEpisodeIterableDataset(IterableDataset):
         self.history_num_frames = int(self.history_context.get("num_history_frames", 4))
         self.history_include_initial = bool(self.history_context.get("include_initial_frame", True))
         self.history_fps = float(self.history_context.get("fps", 30.0))
+        self.stream_batch_size = (
+            int(stream_batch_size) if stream_batch_size is not None else None
+        )
+        if self.stream_batch_size is not None and self.stream_batch_size < 1:
+            raise ValueError("stream_batch_size must be positive")
         if (self.history_span_seconds <= 0 or self.history_num_frames < 0
                 or self.history_fps <= 0):
             raise ValueError(
@@ -396,6 +403,12 @@ class RandomEpisodeIterableDataset(IterableDataset):
         else:
             # Single-worker mode: use all rank_episodes
             fixed_worker_episodes = self.rank_episodes
+
+        if self.stream_batch_size is not None:
+            return self._iter_parallel_stream_batches(
+                fixed_worker_episodes,
+                worker_info.id if worker_info is not None else 0,
+            )
         
         def _gen():
             cycle_count = 0
@@ -431,6 +444,7 @@ class RandomEpisodeIterableDataset(IterableDataset):
                     for episode_pos, idx in enumerate(frame_indices):
                         try:
                             sample = self.base_dataset[idx]
+                            sample["stream_id"] = current_worker_id
                             # Filter out samples with lang == "null"
                             if sample.get("lang") != "null":
                                 if self.history_enabled:
@@ -482,3 +496,90 @@ class RandomEpisodeIterableDataset(IterableDataset):
                     )
         
         return _gen()
+
+    def _iter_parallel_stream_batches(self, worker_episodes, worker_id: int):
+        """Yield aligned recurrent batches from independent episode streams.
+
+        Each batch slot owns one episode stream and advances by exactly one
+        frame per yielded batch. This keeps recurrent memory temporally valid
+        for batch sizes greater than one.
+        """
+        if not worker_episodes:
+            raise RuntimeError(f"DataLoader worker {worker_id} has no episodes")
+        rng = np.random.RandomState(
+            (self.seed if self.seed is not None else 0) + worker_id
+        )
+        episode_order = list(worker_episodes)
+        if self.shuffle:
+            rng.shuffle(episode_order)
+        order_pos = 0
+
+        def next_episode():
+            nonlocal episode_order, order_pos
+            if order_pos >= len(episode_order):
+                if not self.infinite:
+                    return None
+                order_pos = 0
+                if self.shuffle:
+                    rng.shuffle(episode_order)
+            episode_id = episode_order[order_pos]
+            order_pos += 1
+            return episode_id
+
+        slot_episodes = [next_episode() for _ in range(self.stream_batch_size)]
+        slot_positions = [0] * self.stream_batch_size
+        slot_cache = [{} for _ in range(self.stream_batch_size)]
+        slot_initial_images = [None] * self.stream_batch_size
+        while any(episode_id is not None for episode_id in slot_episodes):
+            stream_samples = []
+            for slot, episode_id in enumerate(slot_episodes):
+                sample = None
+                while episode_id is not None:
+                    indices = self.episode_to_indices[episode_id]
+                    position = slot_positions[slot]
+                    if position >= len(indices):
+                        episode_id = next_episode()
+                        slot_episodes[slot] = episode_id
+                        slot_positions[slot] = 0
+                        slot_cache[slot].clear()
+                        slot_initial_images[slot] = None
+                        continue
+                    sample = self.base_dataset[indices[position]]
+                    if sample.get("lang") != "null":
+                        break
+                    slot_positions[slot] += 1
+                if sample is None or episode_id is None:
+                    continue
+                sample["stream_id"] = worker_id
+                if self.history_enabled:
+                    slot_cache[slot][position] = sample["image"][0]
+                    if position == 0:
+                        slot_initial_images[slot] = sample["image"][0]
+                    lookback = max(
+                        1, int(round(self.history_span_seconds * self.history_fps))
+                    )
+                    selected = select_history_positions(
+                        position, lookback, self.history_num_frames,
+                        self.history_include_initial,
+                    )
+                    context = []
+                    for history_pos in selected:
+                        if history_pos == 0 and slot_initial_images[slot] is not None:
+                            context.append(slot_initial_images[slot])
+                        elif history_pos in slot_cache[slot]:
+                            context.append(slot_cache[slot][history_pos])
+                        else:
+                            history_sample = self.base_dataset[indices[history_pos]]
+                            slot_cache[slot][history_pos] = history_sample["image"][0]
+                            context.append(slot_cache[slot][history_pos])
+                    sample["image"] = context
+                    floor = max(1, position - lookback)
+                    slot_cache[slot] = {
+                        idx: image for idx, image in slot_cache[slot].items()
+                        if idx == 0 or idx >= floor
+                    }
+                stream_samples.append(sample)
+                slot_positions[slot] += 1
+
+            if stream_samples:
+                yield stream_samples

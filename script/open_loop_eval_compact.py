@@ -567,7 +567,15 @@ def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
 
     memory = model.init_memory(1, device)
     history_config = history_config or {}
-    independent_history = bool(history_config.get("enabled", False))
+    history_enabled = bool(history_config.get("enabled", False))
+    # v3.1 evaluates the same recurrent COMPACT state used in training.  The
+    # stateless path remains available only as an explicit ablation.
+    # Legacy v3 checkpoints omitted this field and were stateless when
+    # history was enabled; v3.1 stores carry_memory=true explicitly.
+    carry_memory = bool(
+        history_config.get("carry_memory", not history_enabled)
+    )
+    independent_history = history_enabled and not carry_memory
     history_lookback = max(
         1,
         int(round(float(history_config.get("lookback_seconds", 20.0))
@@ -593,7 +601,7 @@ def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
         sample = dataset[start + offset]
         state = torch.as_tensor(sample["state"], dtype=torch.float32).reshape(1, 16).to(device)
         image = sample["image"][0]
-        if independent_history:
+        if history_enabled:
             if offset == 0:
                 initial_image = image
             history_cache[offset] = image
@@ -613,7 +621,8 @@ def _evaluate_mem0(args, model, dataset, actions_raw, states_raw, bounds,
                     position: frame for position, frame in history_cache.items()
                     if position >= oldest
                 }
-            memory = model.init_memory(1, device)
+            if independent_history:
+                memory = model.init_memory(1, device)
         else:
             image_payload = [[image]]
         instruction = _instruction({"subtask": sample.get("lang", "")}, "mem0", args.instruction)

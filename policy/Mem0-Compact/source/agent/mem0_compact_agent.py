@@ -95,7 +95,17 @@ class Mem0CompactAgent:
         if OmegaConf.is_config(history_config):
             history_config = OmegaConf.to_container(history_config, resolve=True)
         self.history_context = dict(history_config or {})
-        self.independent_history = bool(self.history_context.get("enabled", False))
+        self.history_enabled = bool(self.history_context.get("enabled", False))
+        # v3.1 uses history images as additional observation context while
+        # retaining COMPACT's episode-level recurrent state.  A stateless
+        # history run is an explicit ablation, never the implicit behavior.
+        # Legacy v3 checkpoints omitted this field and were stateless when
+        # history was enabled; preserve their evaluation semantics. New v3.1
+        # checkpoints store carry_memory=true explicitly.
+        self.carry_memory = bool(
+            self.history_context.get("carry_memory", not self.history_enabled)
+        )
+        self.independent_history = self.history_enabled and not self.carry_memory
         self.history_lookback_frames = max(
             1,
             int(round(float(self.history_context.get("lookback_seconds", 20.0))
@@ -357,7 +367,7 @@ class Mem0CompactAgent:
         NOT reset here — only the eval loop reacts).
         """
         current_image = obs_payload["image"]
-        if self.independent_history:
+        if self.history_enabled:
             self._history_position += 1
             if self._history_position == 0:
                 self._initial_image = current_image
@@ -391,8 +401,8 @@ class Mem0CompactAgent:
             np.asarray(obs_payload["state"], dtype=np.float32)).reshape(1, 1, 16)
 
         if self.independent_history or self.memory is None:
-            # v3 starts fresh COMPACT memory per observation; prev_action still
-            # follows the training convention and is zero only at episode start.
+            # COMPACT state is initialized once per episode and then threaded
+            # through every observation.  History images do not change this.
             self.memory = self.executor.init_memory(1, self.device)
             if self.independent_history:
                 prev_action = (

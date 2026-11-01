@@ -1,9 +1,9 @@
-# Mem0-Compact v3: Long-History Context With COMPACT Fusion
+# Mem0-Compact v3.1: Long-History Context With Persistent COMPACT Memory
 
 ## Goal
 
-v3 tests whether a compact set of visual observations spanning a long interval
-helps action prediction, without retaining an autograd graph across time. It
+v3.1 tests whether a compact set of visual observations spanning a long interval
+helps action prediction while preserving COMPACT's recurrent episode memory. It
 combines Mem-0's useful separation between an episode anchor and a recent
 sliding window with COMPACT's per-layer Predict/Correct/Inject modules.
 
@@ -38,22 +38,22 @@ historical images give that prediction access to sparse past evidence.
 
 ## COMPACT State and TBPTT
 
-For each training example, COMPACT starts from its learned initial per-layer
-memory state and processes the full image context in one forward. That memory
-is not carried to the next dataset sample. The action and auxiliary losses
-backpropagate through the current multi-image forward, but not through previous
-or future samples.
+For each episode, COMPACT starts from its learned initial per-layer state and
+threads `(M, P, e)` through every observation. The sampled history images are
+additional visual evidence in the current Qwen prompt; they do not initialize,
+replace, or reset the recurrent state. Memory is reset only when the episode
+changes (or when deployment explicitly starts a new episode).
 
-The existing trainer's `window_size` therefore means the number of independent
-examples accumulated into an optimizer update in v3; it no longer determines
-the length of a recurrent graph. The trainer backpropagates each independent
-sample immediately and uses DDP `no_sync()` on intermediate samples. `grad_accum_windows`
-continues to multiply the number of examples per optimizer update.
+`tbptt.window_size` is the number of sequential frames in one recurrent graph.
+At the end of every window, the numerical memory values are retained but
+detached from autograd. Thus the next window can use what the previous window
+remembered, while gradients do not span the entire episode. `grad_accum_windows`
+accumulates several detached windows before one optimizer update. This is the
+efficiency mechanism; it does not turn COMPACT into a stateless model.
 
-This removes long temporal BPTT while retaining gradient flow through COMPACT
-within each current context. It does not remove ordinary activation memory,
-and it does not guarantee a faster iteration: the VLM now encodes multiple
-images per example.
+The explicit `history_context.carry_memory: false` setting is retained only as
+a stateless ablation. It resets COMPACT for every sample and must not be used
+for the v3.1 model described here.
 
 ## History Sampling
 
@@ -90,6 +90,7 @@ The starting config is `source/config/mem0_compact_v3_train.yaml`:
 ```yaml
 history_context:
   enabled: true
+  carry_memory: true
   lookback_seconds: 20.0
   fps: 30
   num_history_frames: 4
@@ -127,11 +128,13 @@ bash policy/Mem0-Compact/source/training/train_ddp.sh \
 
 Training checkpoints use the existing `ckpt_best.pt`, numbered checkpoint,
 and `ckpt_final.pt` formats. For open-loop evaluation, use the existing
-`script/open_loop_eval_compact.py --policy mem0` command with the v3 checkpoint.
-It reads `history_context` from the checkpoint config, maintains the same
-initial-plus-spaced-frame input, and reinitializes COMPACT memory per frame.
-Closed-loop evaluation reconstructs the history setting from the checkpoint
-config and maintains a bounded per-episode image history in the agent.
+`script/open_loop_eval_compact.py --policy mem0` command with the v3.1
+checkpoint. It reads `history_context` from the checkpoint config, maintains the
+same initial-plus-spaced-frame input, and carries COMPACT memory through the
+teacher-forced episode, resetting it only at the episode start. Closed-loop
+evaluation reconstructs the history setting from the checkpoint config and
+maintains both a bounded per-episode image history and persistent COMPACT state
+in the agent.
 
 Open-loop metrics are teacher-forced: observations always come from the dataset,
 not from the policy's predicted actions. They measure action prediction under
@@ -162,9 +165,10 @@ ground-truth observation histories, not closed-loop task success.
 
 ## First Checks To Run
 
-1. A one-rank, one-update training smoke test with `--window-size 1`, one worker,
+1. A one-rank, one-update training smoke test with `--window-size 2`, one worker,
    a single episode, and `--profile-steps 1`; inspect that a mature sample has
-   six images and all selected indices remain in the same episode.
+   six images, all selected indices remain in the same episode, and the memory
+   object is detached only after the two-frame window.
 2. Verify finite action/observation/NLL losses and gradients on COMPACT modules.
 3. Run open-loop evaluation on one short episode and confirm the recorded
    summary reports v3 settings and creates a trajectory plot.
