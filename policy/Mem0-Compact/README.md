@@ -18,18 +18,27 @@ per frame:
   prev_action (16-dim) → MLP → action_embed → memory predict step (zeros at episode start)
 ```
 
-- Memory (M, P, e per layer; 16 slots × mem_dim 128) is threaded across frames,
-  detached at TBPTT window boundaries, reset only at episode start.
+- This repository is the recurrent COMPACT v2.1 path: each sample sees one
+  current image, while per-layer memory `(M, P, e)` is carried frame to frame,
+  detached at TBPTT boundaries, and reset at episode boundaries. There is no
+  additional long-history image stack.
+- The M1 config uses 16 memory slots of width 512 and `lambda_mem: 0.0`;
+  auxiliary-loss weights are config-specific. The M(n) config is separate.
 - Training data: demo_clean 50 eps/task; 4 tasks (put_back_block, swap_blocks,
   cover_blocks, place_block_mat) additionally include demo_clean_200 (200 eps
   appended, 250 total). Episode mapping reads meta/episodes/*.parquet (fast
   path; avoids scanning + decoding every frame).
-- Aux losses: `L = 1.0·L_flow + 0.2·L_cls(Mn) + 0.01·L_obs + 0.01·L_nll + 0.001·L_mem`.
+- Loss is config-controlled: action weight 1.0, M(n) classifier weight 0.2,
+  observation/NLL weights 0.01; M1 sets `lambda_mem=0.0`, while M(n) currently
+  uses `lambda_mem=0.001`.
 - Classifier (4096 → 2048 → 512) disabled for M(1), enabled for M(n).
 - M(n) eval: SubtaskEndClassifier fires sub_end signals; threshold crossing saves
   a keyframe and asks the remote planner (Qwen3-VL-8B via vLLM) for the next
   subtask instruction. COMPACT memory is NOT reset at subtask boundaries.
-- Trained from scratch; single-task; swap_blocks (M1) first.
+- Current experiment: `swap_blocks` (M1), warm-start the Qwen backbone from
+  Mem-0's Qwen-only checkpoint, and freeze that backbone. COMPACT memory and
+  action-head weights remain newly initialized. Full fine-tuning/from-scratch
+  runs remain available through config and CLI overrides.
 
 ## Layout
 
@@ -89,7 +98,7 @@ bash scripts/convert_all.sh
 #   rsync -a --info=progress2 policy/Mem0-Compact/lerobot_datasets/ user@server:/path/to/RMBench/policy/Mem0-Compact/lerobot_datasets/
 #   rsync -a --info=progress2 policy/Mem0-Compact/assets/ user@server:/path/to/RMBench/policy/Mem0-Compact/assets/
 
-# 2. local debug run (8GB GPU escape hatches: window 1 + SGD)
+# 2. local smoke run (small batch/window; SGD is an optional low-VRAM escape hatch)
 python source/training/train_compact.py \
     --config source/config/mem0_compact_train.yaml \
     --task swap_blocks --device cuda --freeze-base 1 \
@@ -98,12 +107,13 @@ python source/training/train_compact.py \
 # Before server training, set execution_module.qwen_vl.model_path in the chosen
 # config YAML to the local Qwen3-VL-2B checkpoint (or allow Hugging Face access).
 
-# 3. single-A800 server run (direct Python; temporally correct batch size)
+# 3. server training. BATCH_SIZE is per rank; the v2.1 loader preserves
+#    independent episode streams for every batch row and supports multiple workers.
 CUDA_VISIBLE_DEVICES=0 \
-  NPROC=1 TASK=swap_blocks BATCH_SIZE=1 MAX_STEPS=30000 \
+  NPROC=1 TASK=swap_blocks BATCH_SIZE=4 MAX_STEPS=30000 \
   SAVE_BEST=1 BEST_START_STEP=1000 BEST_MIN_DELTA=0.01 \
   SAVE_EVERY_STEPS=0 SAVE_FINAL=1 \
-  EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
+  EXTRA_ARGS="--window-size 8 --grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/compact_swap_blocks/ckpt_best.pt and ckpt_final.pt
 
 # M(n) tasks use the classifier-enabled config (λ_cls=0.2 + focal BCE):
@@ -136,30 +146,43 @@ CONFIG=source/config/mem0_baseline_train_mn.yaml \
   EXTRA_ARGS="--grad-ckpt 1 --num-workers 1" bash source/training/train_ddp.sh
 # Outputs: runs/baseline_cover_blocks/ckpt_best.pt and ckpt_final.pt
 
-# BATCH_SIZE is the total per-rank batch. For recurrent COMPACT, the loader
-# creates independent episode streams per batch slot, so each row advances by
-# one frame per forward. With multiple workers, batch_size must be divisible by
-# num_workers; worker microbatches are merged in a stable row order. For example
-# BATCH_SIZE=32 and num_workers=4 means 8 streams per worker, merged to 32 rows.
-# `window_size=4` and `grad_accum_windows=2` process 8 sequential frames per
-# optimizer update while detaching memory gradients every 4 frames.
-# Example v2 scale-up (adjust BATCH_SIZE to fit VRAM; requires BATCH_SIZE >= 4):
-CONFIG=source/config/mem0_compact_train.yaml \
-  CUDA_VISIBLE_DEVICES=2,3,4,5 NPROC=4 TASK=swap_blocks \
-  BATCH_SIZE=8 GRAD_ACCUM_WINDOWS=1 MAX_STEPS=30000 \
-  EXTRA_ARGS="--window-size 4 --num-workers 4 --grad-ckpt 1" \
+# v2.1 batching / TBPTT semantics:
+#   BATCH_SIZE is per rank (episode streams), not a temporal window.
+#   For num_workers > 0, BATCH_SIZE must be divisible by num_workers and
+#   BATCH_SIZE >= num_workers. Workers own stable slots; their microbatches are
+#   merged in a stable order before the model forward.
+#   Each slot advances one frame per forward. Memory carries across frames;
+#   gradients cross window_size frames and memory is detached at each boundary.
+#   grad_accum_windows accumulates multiple detached windows before an update.
+#   Frames/update = BATCH_SIZE * NPROC * window_size * grad_accum_windows.
+# Current M1 warm-start recipe (set these to the server's local model/weight paths):
+BASE_MODEL=/path/to/Qwen3-VL-2B-Instruct
+MEM0_QWEN_ONLY_CKPT=/path/to/mem0_qwen_only.pt
+RUN_CONFIG=/tmp/mem0_compact_v21.yaml
+cp source/config/mem0_compact_train.yaml "$RUN_CONFIG"
+sed -i 's/log_interval: 5/log_interval: 20/' "$RUN_CONFIG"
+# Example: 4 streams/rank × 6 ranks × 32 frames = 768 frame observations/update;
+# 32-frame temporal gradient span per stream. No held-out split: all episodes train.
+CONFIG="$RUN_CONFIG" \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 NPROC=6 TASK=swap_blocks \
+  BATCH_SIZE=4 GRAD_ACCUM_WINDOWS=1 MAX_STEPS=50000 FREEZE_BASE=1 \
+  SAVE_BEST=0 BEST_START_STEP=1000 SAVE_EVERY_STEPS=10000 SAVE_FINAL=1 \
+  EXTRA_ARGS="--model-path $BASE_MODEL --init-from-mem0 $MEM0_QWEN_ONLY_CKPT --window-size 32 --grad-ckpt 1 --num-workers 4 --validation-enabled 0" \
   bash source/training/train_ddp.sh
+# With validation disabled, save_best (if enabled) selects by stochastic
+# training loss. Keep it disabled unless that behavior is intentional.
 # Checkpoint policy:
 #   - after step 1000, save_best=true overwrites ckpt_best.pt whenever the
 #     fixed-seed, episode-disjoint validation action loss reaches a new minimum
 #   - ckpt_final.pt is saved at normal training completion
 #   - save_every_steps=0 disables additional numbered full checkpoints
 #   - best_checkpoint_min_delta can reduce noisy/repeated best saves
-#   - validation uses 10% held-out episodes, no color jitter, and action loss
-#     only (not COMPACT auxiliary losses); it is bounded to 256 frames per rank
-#     by default so distributed ranks cannot wait indefinitely at NCCL reduce.
-#     Set `validation.max_frames_per_rank: 0` for a full pass, or pass
-#     `--validation-enabled 0` to fall back to training-loss selection.
+#   - validation uses validation.fraction held-out episodes, no color jitter,
+#     and action loss only (not COMPACT auxiliary losses); the M1 config bounds
+#     it to 1024 frames per rank. Ranks with no local validation episodes
+#     contribute zero frames while still joining the DDP reduction. Set
+#     `validation.max_frames_per_rank: 0` for a full pass, or pass
+#     `--validation-enabled 0` to train on every episode.
 #   - both files are full resume checkpoints (model + optimizer + scheduler)
 #
 # 8-GPU M(1)-mix Compact run:

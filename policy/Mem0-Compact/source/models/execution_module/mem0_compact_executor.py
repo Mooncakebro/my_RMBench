@@ -24,7 +24,7 @@ Forward contract (one frame batch):
 
 Loss per frame (idea.md §3):
     L = 1.0 * L_flow + 0.2 * L_cls(Mn only)
-        + 0.01 * L_obs + 0.01 * L_nll + 0.001 * L_mem
+        + lambda_obs * L_obs + lambda_nll * L_nll + lambda_mem * L_mem
 """
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ import torch.nn.functional as F
 from source.models.execution_module.compact_wrapper import CompactModeWrapper
 from source.models.execution_module.action_model.ActionHeader import FlowmatchingActionHead
 from source.models.execution_module.classifier.subtask_classifier import SubtaskEndClassifier
-from source.dataloader.history_context import qwen_image_text_mask_positions
 
 from jamel_compact.config import CompactConfig
 
@@ -76,7 +75,7 @@ class Mem0CompactExecutor(nn.Module):
         qwenvl_cfg = em.get("qwen_vl", {})
         model_path = qwenvl_cfg.get("model_path", "./checkpoints/Qwen3-VL-2B-Instruct")
         compact_cfg = em.get("compact", {})
-        mem_dim = int(compact_cfg.get("mem_dim", 128))
+        mem_dim = int(compact_cfg.get("mem_dim", 512))
         num_mem_tokens = int(compact_cfg.get("num_mem_tokens", 16))
         num_heads = int(compact_cfg.get("num_heads", 8))
         num_obs_tokens = int(compact_cfg.get("num_obs_tokens", 4))
@@ -221,15 +220,17 @@ class Mem0CompactExecutor(nn.Module):
         text_mask = torch.zeros((B, N), dtype=torch.bool)
         mm_token_type_ids = torch.zeros((B, N), dtype=torch.long)
         for b in range(B):
-            image_positions, text_positions = qwen_image_text_mask_positions(
-                input_ids[b], self.vision_start_token_id,
-                self.vision_end_token_id, self.im_end_token_id,
-            )
-            if image_positions:
-                image_mask[b, image_positions] = True
-                mm_token_type_ids[b, image_positions] = 1
-            if text_positions:
-                text_mask[b, text_positions] = True
+            ids = input_ids[b]
+            v_start = (ids == self.vision_start_token_id).nonzero(as_tuple=True)[0]
+            v_end = (ids == self.vision_end_token_id).nonzero(as_tuple=True)[0]
+            im_end = (ids == self.im_end_token_id).nonzero(as_tuple=True)[0]
+            if len(v_start) > 0 and len(v_end) > 0:
+                s, e = v_start[0].item() + 1, v_end[0].item()
+                image_mask[b, s:e] = True
+                mm_token_type_ids[b, s:e] = 1
+            if len(v_end) > 0 and len(im_end) > 0:
+                s, e = v_end[0].item() + 1, im_end[0].item()
+                text_mask[b, s:e] = True
 
         device = self.input_device
         return {

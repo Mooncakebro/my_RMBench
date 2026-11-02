@@ -19,13 +19,13 @@ execution_module:
     model_path: /mnt/lvm_storage/songyuebing/LLMs/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
     system_prompt: null
 
-  # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
+  # COMPACT per-layer side memory (16 slots, 512-d memory in this config)
   compact:
     mem_dim: 512
     num_mem_tokens: 16
     num_heads: 8
     num_obs_tokens: 4
-    freeze_base: false          # opt-in via --freeze-base 1 / FREEZE_BASE=1
+    freeze_base: false          # override with --freeze-base 1 / FREEZE_BASE=1
     bf16: true
     gradient_checkpointing: false
     lambda_obs: 0.01

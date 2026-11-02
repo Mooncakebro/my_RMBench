@@ -17,7 +17,7 @@ execution_module:
     model_path: Qwen/Qwen3-VL-2B-Instruct   # HF id or local dir (HF_HUB_OFFLINE=1 uses cache)
     system_prompt: null
 
-  # COMPACT per-layer side memory (idea.md §2.2: mem_dim default 128)
+  # COMPACT per-layer side memory (16 slots, 128-d memory in this config)
   compact:
     mem_dim: 128
     num_mem_tokens: 16
@@ -76,7 +76,7 @@ tbptt:
   detach_at_boundary: true
 
 dataloader:
-  num_workers: 1          # keep at 1: temporal memory assumes batch-slot continuity
+  num_workers: 1          # workers own stable stream slots; batch must divide evenly
   shuffle_episodes: true
   seed: 42
   infinite: true
@@ -84,8 +84,8 @@ dataloader:
 trainer:
   wandb_run_name: null
   resume: null
-  batch_size: 4           # local debug; server: start at 1 and scale
-  max_steps: 100          # windows (local debug); server: 30000
+  batch_size: 4           # total per-rank batch; divisible by num_workers
+  max_steps: 100          # optimizer updates (local debug); server: 30000
   log_interval: 5
   enable_wandb: false
   checkpoint_dir: null    # default policy/Mem0-Compact/runs/<task>

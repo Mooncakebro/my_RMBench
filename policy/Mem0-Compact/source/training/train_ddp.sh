@@ -1,17 +1,17 @@
 #!/bin/bash
 # TBPTT training launcher: direct Python for one GPU, torchrun for DDP.
 #
-# Example (8×A800, global batch 8 = 1 × 8):
+# Example (8 GPUs, per-rank batch 1, global batch 8):
 #   NPROC=8 TASK=swap_blocks bash source/training/train_ddp.sh
 #
 # Env knobs:
 #   NPROC        ranks/GPUs (default 1)
 #   MASTER_PORT  torchrun port (default 29500)
 #   TASK         dataset task under lerobot_datasets/ (default swap_blocks)
-#   BATCH_SIZE   per-rank batch (default 1; global = BATCH_SIZE * NPROC)
+#   BATCH_SIZE   per-rank recurrent streams (global = BATCH_SIZE * NPROC)
 #   MAX_STEPS    optimizer updates (default 30000)
 #   GRAD_ACCUM_WINDOWS detached TBPTT windows per optimizer update (default 1)
-#   FREEZE_BASE  1 to freeze the Qwen base (debug only)
+#   FREEZE_BASE  1 to freeze the Qwen base
 #   CONFIG       config yaml (default source/config/mem0_compact_train.yaml)
 #   VARIANT      executor variant for the default output dir (default: read
 #                from CONFIG's execution_module.variant; runs/${VARIANT}_${TASK})

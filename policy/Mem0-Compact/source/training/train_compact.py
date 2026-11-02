@@ -19,7 +19,7 @@ Per idea.md §3:
 
 Loss per frame:
     L = 1.0 * L_flow + 0.2 * L_cls (M(n) only)
-        + 0.01 * L_obs + 0.01 * L_nll + 0.001 * L_mem
+        + lambda_obs * L_obs + lambda_nll * L_nll + lambda_mem * L_mem
 
 DDP notes:
   - forward must go through `model(batch, memory)` (DDP.forward) — calling
@@ -212,8 +212,7 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
                      shuffle: Optional[bool] = None,
                      infinite: Optional[bool] = None,
                      episode_to_indices=None,
-                     image_augment: bool = True,
-                     history_context: Optional[dict] = None):
+                     image_augment: bool = True):
     trainer_cfg = cfg.get("trainer", {})
     batch_size = batch_size or int(trainer_cfg.get("batch_size", 8))
     num_workers = num_workers if num_workers is not None else int(
@@ -265,8 +264,6 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         infinite = bool(cfg.get("dataloader", {}).get("infinite", True))
     if episode_to_indices is None:
         episode_to_indices = getattr(base_dataset, "episode_to_indices", None)
-    if history_context is None:
-        history_context = cfg.get("history_context", {})
     if num_workers > 0:
         if batch_size < num_workers or batch_size % num_workers:
             raise ValueError(
@@ -285,7 +282,6 @@ def build_dataloader(cfg, task: str, rank: int = 0, world_size: int = 1,
         infinite=infinite,
         episode_ids=list(episode_ids) if episode_ids is not None else None,
         episode_to_indices=episode_to_indices,
-        history_context=history_context,
         stream_batch_size=worker_batch_size,
     )
     loader_kwargs = {
@@ -500,8 +496,7 @@ def split_episode_ids(episode_ids: Sequence[int], validation_fraction: float,
 @torch.inference_mode()
 def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
                          validation_seed: int,
-                         max_frames_per_rank: int = 0,
-                         independent_history: bool = False) -> float:
+                         max_frames_per_rank: int = 0) -> float:
     """Evaluate deterministic action loss over a finite episode-disjoint split.
 
     The action head still performs its configured repeated diffusion draws. RNG
@@ -535,10 +530,7 @@ def validate_action_loss(raw_model, loader, device: torch.device, rank: int,
             reset_mask = [
                 previous_episode[0] < 0 or previous_episode[0] != episode_id[0]
             ]
-            if independent_history:
-                memory = raw_model.init_memory(1, device)
-            else:
-                memory = raw_model.reset_memory_rows(memory, reset_mask, device)
+            memory = raw_model.reset_memory_rows(memory, reset_mask, device)
             previous_action = batch["state"].squeeze(1).to(device).clone()
             if reset_mask[0]:
                 previous_action[0] = 0.0
@@ -628,10 +620,6 @@ def main():
     batch_size = args.batch_size or int(trainer_cfg.get("batch_size", 8))
     num_workers = (args.num_workers if args.num_workers is not None else int(
         cfg.get("dataloader", {}).get("num_workers", 0)))
-    history_cfg = cfg.get("history_context", {})
-    history_enabled = bool(history_cfg.get("enabled", False))
-    carry_memory = bool(history_cfg.get("carry_memory", not history_enabled))
-    history_independent = history_enabled and not carry_memory
     log_interval = int(trainer_cfg.get("log_interval", 5))
     save_every = int(trainer_cfg.get("save_every_steps", 0))
     save_best = bool(trainer_cfg.get("save_best", False))
@@ -796,8 +784,7 @@ def main():
     # loaders so validation sees exactly the same normalization/layout.
     probe_loader = build_dataloader(
         cfg, args.task, rank=rank, world_size=world_size, batch_size=1,
-        num_workers=0, shuffle=False, infinite=False, image_augment=False,
-        history_context={"enabled": False})
+        num_workers=0, shuffle=False, infinite=False, image_augment=False)
     probe_iterable = probe_loader.dataset
     all_episode_ids = sorted(probe_iterable.episode_to_indices.keys())
     episode_groups = getattr(probe_iterable.base_dataset, "episode_to_task", None)
@@ -826,8 +813,7 @@ def main():
         batch_size=batch_size, num_workers=num_workers,
         episode_ids=train_episode_ids,
         episode_to_indices=probe_iterable.episode_to_indices,
-        shuffle=True, infinite=True, image_augment=True,
-        history_context=cfg.get("history_context", {}))
+        shuffle=True, infinite=True, image_augment=True)
     validation_loader = None
     if validation_enabled:
         validation_loader = build_dataloader(
@@ -835,8 +821,7 @@ def main():
             batch_size=1, num_workers=0, base_dataset=probe_iterable.base_dataset,
             episode_ids=validation_episode_ids,
             episode_to_indices=probe_iterable.episode_to_indices,
-            shuffle=False, infinite=False, image_augment=False,
-            history_context=cfg.get("history_context", {}))
+            shuffle=False, infinite=False, image_augment=False)
     if is_rank0():
         rank0_print(
             f"[data] episodes: train={len(train_episode_ids)} "
@@ -856,13 +841,7 @@ def main():
     prev_episode = torch.full((batch_size,), -1, dtype=torch.long, device=device)
     total_iters = max_steps * window_size * grad_accum_windows
 
-    mode = (
-        "stateless history ablation" if history_independent
-        else "recurrent COMPACT + history" if history_enabled
-        else "recurrent COMPACT (v2)"
-    )
-    rank0_print(f"[train] mode={mode}, "
-                f"window_size={window_size}, accum_windows="
+    rank0_print(f"[train] TBPTT window={window_size}, accum_windows="
                 f"{grad_accum_windows}, optimizer_steps={max_steps}, "
                 f"batch={batch_size}x{world_size}, frames={total_iters}")
 
@@ -872,7 +851,7 @@ def main():
     # (gradients accumulate identically), using no_sync on non-last frames
     # under DDP. COMPACT keeps the single per-window backward — its memory
     # legitimately connects the K frames in one graph.
-    incremental_bwd = (variant == "baseline" or history_independent)
+    incremental_bwd = (variant == "baseline")
     for step in range(start_step, max_steps):
         t0 = time.time()
         profiling = args.profile_steps > 0 and (step - start_step) < args.profile_steps
@@ -912,10 +891,7 @@ def main():
                         (prev_episode[i] < 0 or prev_episode[i] != ep_ids[i])
                         for i in range(batch_size)
                     ]
-                    if history_independent:
-                        memory = raw_model.init_memory(batch_size, device)
-                    else:
-                        memory = raw_model.reset_memory_rows(memory, reset_mask, device)
+                    memory = raw_model.reset_memory_rows(memory, reset_mask, device)
                     prev_action = batch["state"].squeeze(1).to(device).clone().detach()
                     for i in range(batch_size):
                         if reset_mask[i]:
@@ -979,8 +955,7 @@ def main():
 
             # TBPTT truncation occurs after every K-frame window, including
             # windows accumulated into the same optimizer update.
-            if not history_independent:
-                memory = raw_model.detach_memory(memory)
+            memory = raw_model.detach_memory(memory)
 
         if not all_ranks_finite(update_loss):
             rank0_print(
@@ -1056,7 +1031,6 @@ def main():
                 rank,
                 validation_seed,
                 max_frames_per_rank=validation_max_frames,
-                independent_history=history_independent,
             )
             rank0_print(
                 f"[val] step {step+1}/{max_steps} "

@@ -57,11 +57,13 @@ Implementation must follow it exactly; deviations require explicit approval.
   zero-init inject, aux losses) — copied, not imported across repos.
 - `compact_mode/compact_wrapper.py` (`CompactModeWrapper` — runs the decoder
   manually: predict → pretrained layer → DeepStack → observe → correct → inject).
-- Memory dims: `num_mem_tokens=16`, `mem_dim` configurable, **default 128**;
+- Memory dims: `num_mem_tokens=16`, `mem_dim` configurable (512 in the current
+  M1 config; 128 in the M(n) config);
   per-layer memory state + variance + surprise carried externally.
-- Aux losses kept: `L_obs`, `L_nll`, `L_mem` with CompactMoDE weights
-  (λ_obs=0.01, λ_nll=0.01, λ_mem=0.001), on top of flow-matching action loss
-  (λ=1.0) and subtask-end classifier loss (λ=0.2, as in Mem-0).
+- Aux losses kept: `L_obs`, `L_nll`, `L_mem`; their weights are config-specific.
+  Current M1 uses λ_obs=0.01, λ_nll=0.01, λ_mem=0.0; M(n) retains a nonzero
+  memory penalty. Both sit on top of flow-matching action loss (λ=1.0) and
+  subtask-end classifier loss (λ=0.2 for M(n)).
 - `prev_action` (last executed action, embedded via `action_embed` + FiLM-GRU)
   drives the predict step — same as CompactMoDE. First frame of an episode uses
   a zero prev-action.
@@ -82,13 +84,13 @@ Implementation must follow it exactly; deviations require explicit approval.
   features as before.
 
 ### 2.4 Trainable vs frozen
-- Default: Qwen3-VL-2B base **trainable** (end-to-end), matching Mem-0's default
-  (`freeze_modules: ""`). Freezing is opt-in (env flag / config), same convention
-  as CompactMoDE (`FREEZE_BASE=1`).
+- Config default: Qwen3-VL-2B base trainable end-to-end. The current warm-start
+  experiment instead loads Mem-0's Qwen-only checkpoint and freezes Qwen
+  (`FREEZE_BASE=1`); COMPACT memory and action-head modules remain trainable.
 - Always trainable: all `SideMemoryModule` weights, `action_embed`,
   `prev_action_mlp` (if used), DiT head, state encoder, classifier.
-- Per-module LRs follow Mem-0's scheme (qwen 1e-5, heads 1e-4); side-memory
-  params get the CompactMoDE memory LR (5e-6) as a separate param group.
+- Per-module LRs are configured separately (current M1: Qwen 1e-5, action
+  1e-4, memory 5e-5; frozen Qwen parameters are excluded from optimization).
 
 ### 2.5 Baseline variant (ablation, owner-requested)
 
@@ -135,26 +137,33 @@ or `--variant baseline`) measures the COMPACT memory's contribution:
   was a resource compromise for the release, NOT the scheme. Multi-task joint
   training is a possible later experiment, not part of this contract.
 - Iterate frames **sequentially within an episode** via
-  `RandomEpisodeIterableDataset` — verified suitable: `_gen()`
-  (`random_episode_dataloader.py:332-346`) yields frames in sorted order within
-  an episode, episodes are shard-fixed per rank and per worker (no overlap),
-  and each sample carries `episode_id` for boundary detection. Note it silently
-  drops `lang == "null"` frames (line 341), so the stream can skip frames
-  mid-episode — tolerable for memory, but known.
+  `RandomEpisodeIterableDataset`; each batch slot owns an independent stream,
+  and each worker owns a fixed subset of the rank's slots/episodes. Worker
+  microbatches are merged in stable order before each forward. Episode IDs are
+  used for per-slot memory reset. The loader silently drops `lang == "null"`
+  frames, so a stream can skip frames mid-episode; this remains a known caveat.
 - The TBPTT work is in the **training loop**, not the dataloader. Mem-0's
-  current loop does `loss.backward()` per batch (`train_low.py:229-234`) and
-  their MemoryBank vectors are detached — no BPTT exists today. Our loop must:
-  carry `(memory_states, variance_states, e_list, prev_action)` across steps;
-  accumulate loss over a K-frame window; one backward per window; `detach()`
-  memory at window boundaries; gradients never cross windows.
+  original loop does `loss.backward()` per batch (`train_low.py:229-234`) and
+  its MemoryBank vectors are detached — no BPTT exists there. This trainer
+  carries memory and `prev_action` across frames, accumulates loss over K
+  sequential frames, backpropagates once per window, and detaches memory at
+  each boundary. Gradients never cross TBPTT windows.
 - Per-sample episode reset: when a sample slot's `episode_id` changes between
   consecutive batches, reset that slot's memory to `init_memory`/`init_variance`,
   `e=None`, `prev_action=zeros`. **No reset at subtask boundaries**
   (decision 3).
-- Loss per frame = flow-matching action loss + 0.2 × subtask-end BCE/focal
-  + 0.01 × L_obs + 0.01 × L_nll + 0.001 × L_mem.
-- DDP: episode-level sharding already exists (`episode % world_size == rank`);
-  memory state is per-sample, no cross-rank coupling.
+- Loss per frame = config-weighted flow-matching action loss, optional M(n)
+  classifier loss, and COMPACT auxiliary losses. Current weights are listed in
+  §2.2; do not assume the M1 and M(n) memory penalties are the same.
+- Batch and time are separate dimensions. Per-rank `batch_size=B` means B
+  independent episode streams; `window_size=K` means K sequential forwards
+  whose losses share one BPTT graph; `grad_accum_windows=A` accumulates A
+  detached K-frame windows before the optimizer step. Global observations per
+  update are `B × world_size × K × A`. Memory values carry across TBPTT
+  boundaries even though their autograd history is detached there.
+- For multiple DataLoader workers, B must be divisible by worker count and at
+  least that count. Episode-level sharding is rank-local; memory rows never
+  couple across ranks.
 
 ## 3.5 M(1) vs M(n) task types (verified from Mem-0 README + data-prep scripts)
 
@@ -201,19 +210,21 @@ Compatibility if used as init:
 - SubtaskEndClassifier: **cannot load** (input dim 6144→4096); re-init.
 - Side memory modules: always fresh.
 
-**DECISION (owner, confirmed):** train **from scratch**. No released-weight
-warm-start. The released weights are still downloaded locally
-(`policy/Mem0-Compact/checkpoints/released/`) for reference and for running the
-original Mem-0 as the comparison baseline.
+**Current experiment (owner-confirmed):** warm-start from the released Mem-0
+Qwen-only checkpoint and freeze the Qwen backbone. COMPACT memory and the
+action head remain newly initialized/trainable. The trainer also accepts a full
+Mem-0 execution checkpoint, in which case shape-compatible Qwen and DiT tensors
+are loaded; incompatible MemoryBank/classifier tensors are not transferred.
 
-**Training settings align with Mem-0's per-task recipe where feasible**
-(README "GPU Resource Requirements"): 30K training iterations, global batch 448
-(56 × 8 A800), per-module LRs (qwen 1e-5, action head/classifier 1e-4) + side
-memory LR 5e-6, bf16. Deviations only where the COMPACT mechanism forces them
-(TBPTT windowing) or where the server setup requires; any such deviation must
-be documented in the run config.
+The original Mem-0 uses a much larger parallel batch. COMPACT v2.1 exposes
+sequence length through TBPTT instead: for example B=4 per rank, 6 ranks,
+K=32 and A=1 processes 768 observations/update with a 32-frame temporal
+gradient span. Compare experiments by observations/update and throughput, not
+seconds/update alone. Record batch, window, accumulation, worker count, freeze,
+warm-start checkpoint, and loss weights with every run.
 
-**First task: `swap_blocks` (M1)** — from scratch, executor-only, no planner.
+**First task: `swap_blocks` (M1)** — Mem-0 Qwen-only warm start, frozen
+backbone, trainable COMPACT memory and action head; no planner.
 
 ## 4. Eval / deployment
 
@@ -264,7 +275,7 @@ be documented in the run config.
 ## 8. Open questions (defer unless they block implementation)
 
 - TBPTT window size K: start from CompactMoDE's value; sweep later.
-- Whether `mem_dim=128` is right for Mem-0's 2048-d pooled features — sweep
-  8–512 later, default 128.
+- Whether `mem_dim=512` (M1 config) and `mem_dim=128` (M(n) config) are right
+  for Mem-0's 2048-d pooled features — sweep later.
 - Whether the subtask-end classifier should also condition on memory-pooled
   features (currently it sees the same 2 summary tokens as the DiT).

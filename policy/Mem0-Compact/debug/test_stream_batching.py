@@ -55,6 +55,16 @@ def main():
                 assert ep == prev_ep and pos == prev_pos + 1, (previous, current)
         previous = current
     del batches, loader
+
+    empty_dataset = RandomEpisodeIterableDataset(
+        FakeFrames(), rank=0, world_size=1, shuffle=False, infinite=False,
+        episode_ids=[], episode_to_indices=episode_to_indices,
+        stream_batch_size=1,
+    )
+    empty_loader = DataLoader(
+        empty_dataset, batch_size=None, num_workers=0, collate_fn=collate_batch,
+    )
+    assert list(empty_loader) == []
     print("recurrent multiworker stream batching: OK")
 
 
