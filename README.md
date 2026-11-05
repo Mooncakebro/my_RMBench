@@ -408,6 +408,7 @@ the action-head layers whose shapes differ stay freshly initialized.
 cd policy/Mem0-Compact
 conda activate lerobot
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export REPO_ROOT=$(pwd)
 
 BASE_MODEL=/path/to/Qwen3-VL-2B-Instruct
 MEM0_CKPT=checkpoints/released/m1mix/checkpoint/m1_mix_final_step50000.pt
@@ -418,6 +419,7 @@ sed -i 's/log_interval: 5/log_interval: 20/' "$RUN_CONFIG"
 CONFIG="$RUN_CONFIG" \
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 TASK=swap_blocks \
   BATCH_SIZE=32 GRAD_ACCUM_WINDOWS=1 MAX_STEPS=50000 FREEZE_BASE=1 \
+  OUTPUT_DIR="$REPO_ROOT/policy/Mem0-Compact/runs/compact_swap_blocks_warm" \
   SAVE_BEST=0 SAVE_EVERY_STEPS=10000 SAVE_FINAL=1 \
   EXTRA_ARGS="--model-path $BASE_MODEL --init-from-mem0 $MEM0_CKPT --window-size 2 --grad-ckpt 1 --num-workers 4 --validation-enabled 0" \
   bash source/training/train_ddp.sh 2>&1 | tee train_compact_swap_blocks_warm.log
