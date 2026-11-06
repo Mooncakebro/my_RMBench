@@ -46,6 +46,7 @@ class Mem0CompactAgent:
         self.config = cfg
 
         checkpoint_payload = self._load_checkpoint_payload(ckpt_path)
+        self._adopt_checkpoint_architecture(checkpoint_payload)
         self._resolve_base_model_path(checkpoint_payload)
 
         task_name = self.config.get("task_name", "unknown_task")
@@ -138,12 +139,13 @@ class Mem0CompactAgent:
         loads as baseline even if the yml still says compact (and vice versa).
         """
         ckpt_cfg = payload.get("config") if isinstance(payload, dict) else None
-        if isinstance(ckpt_cfg, dict):
-            em_cfg = ckpt_cfg.get("execution_module", {})
-            if isinstance(em_cfg, dict) and em_cfg.get("variant"):
-                variant = str(em_cfg["variant"])
-                if variant in EXECUTOR_VARIANTS:
-                    return variant
+        checkpoint_variant = self._config_value(
+            ckpt_cfg, "execution_module.variant"
+        )
+        if checkpoint_variant:
+            variant = str(checkpoint_variant)
+            if variant in EXECUTOR_VARIANTS:
+                return variant
         variant = str(OmegaConf.select(
             self.config, "execution_module.variant", default="compact"))
         if variant not in EXECUTOR_VARIANTS:
@@ -151,6 +153,86 @@ class Mem0CompactAgent:
                 f"unknown executor variant {variant!r}; expected one of "
                 f"{sorted(EXECUTOR_VARIANTS)}")
         return variant
+
+    @staticmethod
+    def _config_value(config, path):
+        """Read a dotted value from either a dict or an OmegaConf node."""
+        current = config
+        for key in path.split("."):
+            if hasattr(current, "get"):
+                current = current.get(key)
+            elif isinstance(current, dict):
+                current = current.get(key)
+            else:
+                return None
+            if current is None:
+                return None
+        return current
+
+    def _adopt_checkpoint_architecture(self, payload) -> None:
+        """Make the deployment config reconstruct the saved model architecture.
+
+        A deployment YAML is shared by several runs, while each checkpoint
+        records the exact architecture used during training.  Shape-critical
+        fields therefore come from the checkpoint before the executor is
+        built.  Runtime-only settings (device, stats, task text, and action
+        execution stride) remain controlled by the deployment command.
+        """
+        checkpoint_config = (
+            payload.get("config") if isinstance(payload, dict) else None
+        )
+        if checkpoint_config is None:
+            return
+
+        # These fields change parameter/state shapes or the action head's
+        # output contract and must match the checkpoint exactly.
+        fields = [
+            ("execution_module.action_model.action_model_type", str),
+            ("execution_module.action_model.action_dim", int),
+            ("execution_module.action_model.state_dim", int),
+            ("execution_module.action_model.action_horizon", int),
+            ("execution_module.action_model.num_inference_timesteps", int),
+            ("execution_module.use_classifier", bool),
+            ("execution_module.compact.mem_dim", int),
+            ("execution_module.compact.num_mem_tokens", int),
+            ("execution_module.compact.num_heads", int),
+            ("execution_module.compact.num_obs_tokens", int),
+        ]
+        for path, cast in fields:
+            actual = self._config_value(checkpoint_config, path)
+            if actual is None:
+                continue
+            actual = cast(actual)
+            expected = self._config_value(self.config, path)
+            if expected is not None and cast(expected) == actual:
+                continue
+            OmegaConf.update(self.config, path, actual, merge=False)
+            cprint(
+                f"[Mem0-Compact] adopting checkpoint architecture: {path} "
+                f"{expected!r} -> {actual!r}",
+                "cyan",
+            )
+
+        # The public horizon is checked against the nested action-head
+        # horizon below. Keep it synchronized when the checkpoint supplies a
+        # horizon, including when the deployment YAML used another default.
+        checkpoint_horizon = self._config_value(
+            checkpoint_config,
+            "execution_module.action_model.action_horizon",
+        )
+        if checkpoint_horizon is not None:
+            checkpoint_horizon = int(checkpoint_horizon)
+            runtime_horizon = self.config.get("action_horizon")
+            if (runtime_horizon is not None
+                    and int(runtime_horizon) != checkpoint_horizon):
+                OmegaConf.update(
+                    self.config, "action_horizon", checkpoint_horizon, merge=False
+                )
+                cprint(
+                    "[Mem0-Compact] adopting checkpoint architecture: "
+                    f"action_horizon {runtime_horizon!r} -> {checkpoint_horizon!r}",
+                    "cyan",
+                )
 
     def _resolve_base_model_path(self, payload) -> None:
         """Prefer an available local base model for offline evaluation.
@@ -225,19 +307,6 @@ class Mem0CompactAgent:
                 "Mem0-Compact architecture compatibility cannot be verified"
             )
 
-        def config_value(config, path):
-            current = config
-            for key in path.split("."):
-                if hasattr(current, "get"):
-                    current = current.get(key)
-                elif isinstance(current, dict):
-                    current = current.get(key)
-                else:
-                    return None
-                if current is None:
-                    return None
-            return current
-
         fields = [
             ("execution_module.action_model.action_model_type", str),
             ("execution_module.action_model.action_dim", int),
@@ -256,8 +325,8 @@ class Mem0CompactAgent:
         fields = tuple(fields)
         mismatches = []
         for path, cast in fields:
-            expected = config_value(self.config, path)
-            actual = config_value(checkpoint_config, path)
+            expected = self._config_value(self.config, path)
+            actual = self._config_value(checkpoint_config, path)
             if expected is None or actual is None:
                 mismatches.append(f"{path}: missing (runtime={expected}, checkpoint={actual})")
                 continue

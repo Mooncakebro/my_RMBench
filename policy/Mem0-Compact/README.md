@@ -289,6 +289,13 @@ python script/eval_policy.py --config policy/Mem0-Compact/deploy_policy.yml --ov
     --action_execute_steps 1
 ```
 
+Deployment reconstructs shape-critical architecture fields from the checkpoint
+(`mem_dim`, memory-token/head counts, action dimensions/horizon, diffusion
+steps, and classifier usage) before building the executor. The shared YAML can
+therefore evaluate both 128- and 512-wide COMPACT checkpoints; device,
+normalization stats, task text, and action execution stride remain runtime
+settings.
+
 Deploy pipeline check without SAPIEN (both task types):
 
 ```bash
