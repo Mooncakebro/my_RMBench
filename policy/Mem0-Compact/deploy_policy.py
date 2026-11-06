@@ -95,7 +95,14 @@ def _load_stats(stats_path: str) -> None:
 
 
 def _postprocess_action_chunk(actions_model: np.ndarray) -> np.ndarray:
-    """Denormalize + reorder model layout → env layout (T, 16)."""
+    """Denormalize/reorder model actions into RMBench's 14D qpos layout.
+
+    The model uses a padded 16D layout:
+    ``[LA0..LA5, pad, RA0..RA5, pad, LGrip, RGrip]``.
+    SAPIEN's dual-arm ``take_action(..., action_type="qpos")`` expects
+    ``[LA0..LA5, LGrip, RA0..RA5, RGrip]`` (14 values).  The two padding
+    entries must be removed before handing actions to the environment.
+    """
     chunk = np.array(actions_model, dtype=np.float32)
     if chunk.ndim == 1:
         chunk = chunk.reshape(1, -1)
@@ -103,7 +110,15 @@ def _postprocess_action_chunk(actions_model: np.ndarray) -> np.ndarray:
     processed = []
     for step in flat_actions:
         denorm = _denormalize_action(step)
-        processed.append(model_to_env_layout(denorm))
+        env_order = model_to_env_layout(denorm)
+        if env_order.shape[-1] >= 16:
+            # Match policy/Mem-0/deploy_policy.py and envs/_base_task.py.
+            env_order = np.concatenate(
+                (env_order[0:6], env_order[7:8],
+                 env_order[8:14], env_order[15:16]),
+                axis=0,
+            )
+        processed.append(env_order)
     return np.stack(processed, axis=0)
 
 

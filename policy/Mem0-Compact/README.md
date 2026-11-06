@@ -296,6 +296,11 @@ therefore evaluate both 128- and 512-wide COMPACT checkpoints; device,
 normalization stats, task text, and action execution stride remain runtime
 settings.
 
+The model state/action tensors use a padded 16D layout, but RMBench's dual-arm
+SAPIEN `qpos` interface uses 14 values. Deployment removes the two padding
+entries before calling `TASK_ENV.take_action`; this is required to keep both
+grippers and both arm joint groups aligned.
+
 Deploy pipeline check without SAPIEN (both task types):
 
 ```bash
